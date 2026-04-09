@@ -1,0 +1,18 @@
+[package]
+name = "rdecomp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+goblin = "0.9"          # PE/ELF/Mach-O binary parsing
+iced-x86 = "1.21"       # High-performance x86/x64 disassembler
+clap = { version = "4", features = ["derive"] }
+petgraph = "0.7"        # Graph data structures for CFG
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
