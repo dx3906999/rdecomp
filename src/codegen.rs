@@ -58,14 +58,20 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
+        // Determine return type: void if all returns carry no value
+        let is_void = func.blocks.iter().all(|b| {
+            !matches!(&b.terminator, Terminator::Return(Some(_)))
+        });
+        let ret_type = if is_void { "void" } else { "uint64_t" };
+
         // Function signature with parameters
         if params.is_empty() {
-            let _ = writeln!(out, "uint64_t {}() {{", func.name);
+            let _ = writeln!(out, "{ret_type} {}() {{", func.name);
         } else {
             let param_str: Vec<String> = params.iter()
                 .map(|(name, w)| format!("{} {}", c_type(*w), name))
                 .collect();
-            let _ = writeln!(out, "uint64_t {}({}) {{", func.name, param_str.join(", "));
+            let _ = writeln!(out, "{ret_type} {}({}) {{", func.name, param_str.join(", "));
         }
 
         self.param_vars = param_var_names.clone();
@@ -103,8 +109,8 @@ impl<'a> CodeGenerator<'a> {
 
         // Structured control flow recovery
         let all_ids: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
-        let loop_headers = self.find_loop_headers(func, cfg);
-        let loop_bodies = self.compute_all_loop_bodies(func, &loop_headers);
+        let (loop_headers, back_edge_sources) = self.find_loop_info(func, cfg);
+        let loop_bodies = self.compute_all_loop_bodies(func, &loop_headers, &back_edge_sources);
         let nodes = self.structure_region(func, cfg, &all_ids, &loop_headers, &loop_bodies, None);
         let code = self.emit_structured(&nodes, func);
         out.push_str(&code);
@@ -123,7 +129,12 @@ impl<'a> CodeGenerator<'a> {
 
         for block in &func.blocks {
             for stmt in &block.stmts {
-                if let Stmt::Assign(var, _) = stmt {
+                let var = match stmt {
+                    Stmt::Assign(v, _) => Some(v),
+                    Stmt::Call(Some(v), _, _) => Some(v),
+                    _ => None,
+                };
+                if let Some(var) = var {
                     match var {
                         Var::Stack(off, w) => {
                             let name = if *off >= 0 {
@@ -147,58 +158,72 @@ impl<'a> CodeGenerator<'a> {
 
     // ── Loop detection ───────────────────────────────────────────
 
-    /// Find all loop header block IDs (targets of back-edges).
-    fn find_loop_headers(&self, func: &Function, cfg: &Cfg) -> BTreeSet<BlockId> {
+    /// Find all loop headers and their back-edge sources from the CFG.
+    /// Returns (set of header BlockIds, map from header → list of back-edge source BlockIds).
+    fn find_loop_info(
+        &self,
+        func: &Function,
+        cfg: &Cfg,
+    ) -> (BTreeSet<BlockId>, HashMap<BlockId, Vec<BlockId>>) {
         let back_edges = cfg.back_edges();
         let addr_to_id: HashMap<u64, BlockId> = func
             .blocks
             .iter()
             .map(|b| (b.addr, b.id))
             .collect();
-        back_edges
-            .iter()
-            .filter_map(|(_, header_addr)| addr_to_id.get(header_addr).copied())
-            .collect()
+        let mut headers = BTreeSet::new();
+        let mut sources: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for (src_addr, hdr_addr) in &back_edges {
+            if let (Some(&src_id), Some(&hdr_id)) =
+                (addr_to_id.get(src_addr), addr_to_id.get(hdr_addr))
+            {
+                headers.insert(hdr_id);
+                sources.entry(hdr_id).or_default().push(src_id);
+            }
+        }
+        (headers, sources)
     }
 
-    /// Compute natural loop body for each loop header.
+    /// Compute natural loop body for each loop header using the known back-edge sources.
     fn compute_all_loop_bodies(
         &self,
         func: &Function,
         headers: &BTreeSet<BlockId>,
+        back_edge_sources: &HashMap<BlockId, Vec<BlockId>>,
     ) -> HashMap<BlockId, BTreeSet<BlockId>> {
         let mut result = HashMap::new();
         for &header in headers {
-            result.insert(header, self.natural_loop_body(func, header));
+            let srcs = back_edge_sources
+                .get(&header)
+                .map_or(&[][..], |v| v.as_slice());
+            result.insert(header, self.natural_loop_body(func, header, srcs));
         }
         result
     }
 
     /// Compute the natural loop body: header + all blocks that can reach the
-    /// header's back-edge source without going through outside the loop.
-    fn natural_loop_body(&self, func: &Function, header: BlockId) -> BTreeSet<BlockId> {
+    /// back-edge source(s) without going through outside the loop.
+    ///
+    /// Uses the standard algorithm: seed from known back-edge sources (determined
+    /// by dominance in `cfg.back_edges()`), then walk predecessors backwards.
+    fn natural_loop_body(
+        &self,
+        func: &Function,
+        header: BlockId,
+        back_edge_sources: &[BlockId],
+    ) -> BTreeSet<BlockId> {
         let mut body = BTreeSet::new();
         body.insert(header);
 
-        let header_addr = func.block(header).map(|b| b.addr).unwrap_or(0);
-
-        // Find true back-edge sources: blocks that jump to header AND appear after it
-        // (i.e., their address > header's address, meaning they loop back)
         let mut worklist: Vec<BlockId> = Vec::new();
-        for block in &func.blocks {
-            let succs = match &block.terminator {
-                Terminator::Jump(t) => vec![*t],
-                Terminator::Branch(_, t, f) => vec![*t, *f],
-                _ => vec![],
-            };
-            if succs.contains(&header) && block.id != header && block.addr > header_addr {
-                if body.insert(block.id) {
-                    worklist.push(block.id);
-                }
+        for &src in back_edge_sources {
+            if body.insert(src) {
+                worklist.push(src);
             }
         }
 
-        // Walk backwards from back-edge sources
+        // Walk backwards: add predecessors until we reach blocks already in the body
+        // (the header acts as the implicit stop because it's already inserted).
         while let Some(bid) = worklist.pop() {
             for pred in func.predecessors(bid) {
                 if body.insert(pred) {
@@ -208,6 +233,19 @@ impl<'a> CodeGenerator<'a> {
         }
 
         body
+    }
+
+    /// Check if a merge block is a "return relay": no meaningful stmts, just returns.
+    /// When all if/else arms already emit their own return via goto-tail inlining,
+    /// such a merge block is dead code and should be skipped.
+    fn is_return_relay(&self, func: &Function, merge: Option<BlockId>) -> bool {
+        let Some(bid) = merge else { return false };
+        let Some(block) = func.block(bid) else { return false };
+        if !matches!(block.terminator, Terminator::Return(_)) {
+            return false;
+        }
+        // All stmts must be register assignments or nops (no meaningful computation)
+        block.stmts.iter().all(|s| matches!(s, Stmt::Nop | Stmt::Assign(Var::Reg(_, _), _)))
     }
 
     /// Find the loop exit block (first block outside the loop that is a successor of a loop block).
@@ -251,8 +289,34 @@ impl<'a> CodeGenerator<'a> {
             loop_bodies.get(&header).and_then(|body| self.find_loop_exit(func, body))
         });
 
+        // Defer loop-interior blocks: blocks that belong to a loop whose header
+        // is in this region. They will be processed as part of the While body
+        // when the header is reached, avoiding premature consumption by if-else.
+        let deferred: HashSet<BlockId> = {
+            let mut set = HashSet::new();
+            for &hdr in loop_headers {
+                if block_set.contains(&hdr) && Some(hdr) != enclosing_loop {
+                    if let Some(body) = loop_bodies.get(&hdr) {
+                        for &b in body {
+                            if b != hdr && block_set.contains(&b) {
+                                set.insert(b);
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        };
+
         while i < block_ids.len() {
             let bid = block_ids[i];
+
+            // Skip blocks deferred to their loop header's While body
+            if deferred.contains(&bid) && !loop_headers.contains(&bid) {
+                i += 1;
+                continue;
+            }
+
             let block = match func.block(bid) {
                 Some(b) => b,
                 None => {
@@ -265,8 +329,9 @@ impl<'a> CodeGenerator<'a> {
             if loop_headers.contains(&bid) && Some(bid) != enclosing_loop {
                 let body = &loop_bodies[&bid];
 
-                // Collect body block IDs in layout order (skip the header itself for the body)
-                let body_block_ids: Vec<BlockId> = block_ids[i..]
+                // Collect body block IDs in layout order from ALL blocks in region
+                // (not just from i.., since rotated loops have body before header)
+                let body_block_ids: Vec<BlockId> = block_ids
                     .iter()
                     .copied()
                     .filter(|b| body.contains(b) && *b != bid)
@@ -333,18 +398,22 @@ impl<'a> CodeGenerator<'a> {
                     else if next_in_layout == Some(target) {
                         result.push(StructuredNode::Stmts(bid));
                     }
-                    // Jump to exit or outside region → try to inline the tail chain
-                    else {
-                        // If target is in the function but outside the region, inline the tail
+                    // Jump outside region → check if target chain leads to return
+                    else if !block_set.contains(&target) {
+                        // If the goto-tail chain ends with a return, inline it;
+                        // otherwise treat as implicit structured exit (merge/parent).
                         let tail = self.collect_goto_tail(func, target);
-                        if !tail.is_empty() {
-                            result.push(StructuredNode::Stmts(bid));
-                            for &tail_bid in &tail {
-                                result.push(StructuredNode::Block(tail_bid));
-                            }
-                        } else {
+                        let ends_with_return = tail.last().and_then(|&b| func.block(b))
+                            .is_some_and(|b| matches!(b.terminator, Terminator::Return(_)));
+                        if ends_with_return {
                             result.push(StructuredNode::Block(bid));
+                        } else {
+                            result.push(StructuredNode::Stmts(bid));
                         }
+                    }
+                    // Jump to somewhere in region but not next → emit with goto-tail
+                    else {
+                        result.push(StructuredNode::Block(bid));
                     }
                 }
 
@@ -424,6 +493,29 @@ impl<'a> CodeGenerator<'a> {
                     else if next_in_layout == Some(f) {
                         result.push(StructuredNode::Stmts(bid));
                         let merge = self.find_merge_point(func, t, f, &block_set);
+
+                        // Diamond: if merge == t, the true branch jumps straight to
+                        // merge and the false branch (f, which is next_in_layout) is
+                        // the actual "then" body under a negated condition.
+                        if merge == Some(t) {
+                            let then_blocks = self.collect_arm_blocks(func, f, merge, &block_set, enclosing_loop);
+                            let then_body = if then_blocks.is_empty() {
+                                vec![StructuredNode::Block(f)]
+                            } else {
+                                self.structure_region(func, cfg, &then_blocks, loop_headers, loop_bodies, enclosing_loop)
+                            };
+                            result.push(StructuredNode::IfThen {
+                                condition: negate_condition(&cond),
+                                then_body,
+                            });
+                            let skip: HashSet<BlockId> = then_blocks.iter().copied().collect();
+                            i += 1;
+                            while i < block_ids.len() && skip.contains(&block_ids[i]) {
+                                i += 1;
+                            }
+                            continue;
+                        }
+
                         let then_blocks = self.collect_arm_blocks(func, t, merge, &block_set, enclosing_loop);
 
                         let then_body = if then_blocks.is_empty() {
@@ -465,14 +557,40 @@ impl<'a> CodeGenerator<'a> {
                         while i < block_ids.len() && (skip.contains(&block_ids[i]) || else_skip.contains(&block_ids[i])) {
                             i += 1;
                         }
-                        // If no merge point, both arms terminate — remaining blocks are dead code
-                        if merge.is_none() && !skip.is_empty() && !else_skip.is_empty() {
+                        // If both arms terminate (no merge, or merge is a pure return relay),
+                        // remaining blocks are dead code.
+                        if (merge.is_none() || self.is_return_relay(func, merge))
+                            && !skip.is_empty() && !else_skip.is_empty()
+                        {
                             break;
                         }
                         continue;
                     } else if next_in_layout == Some(t) {
                         result.push(StructuredNode::Stmts(bid));
                         let merge = self.find_merge_point(func, f, t, &block_set);
+
+                        // Diamond: if merge == f, the false branch jumps straight to
+                        // merge and the true branch (t, which is next_in_layout) is
+                        // the actual "then" body under the original condition.
+                        if merge == Some(f) {
+                            let then_blocks = self.collect_arm_blocks(func, t, merge, &block_set, enclosing_loop);
+                            let then_body = if then_blocks.is_empty() {
+                                vec![StructuredNode::Block(t)]
+                            } else {
+                                self.structure_region(func, cfg, &then_blocks, loop_headers, loop_bodies, enclosing_loop)
+                            };
+                            result.push(StructuredNode::IfThen {
+                                condition: cond.clone(),
+                                then_body,
+                            });
+                            let skip: HashSet<BlockId> = then_blocks.iter().copied().collect();
+                            i += 1;
+                            while i < block_ids.len() && skip.contains(&block_ids[i]) {
+                                i += 1;
+                            }
+                            continue;
+                        }
+
                         let then_blocks = self.collect_arm_blocks(func, f, merge, &block_set, enclosing_loop);
 
                         let then_body = if then_blocks.is_empty() {
@@ -514,8 +632,11 @@ impl<'a> CodeGenerator<'a> {
                         while i < block_ids.len() && (skip.contains(&block_ids[i]) || else_skip.contains(&block_ids[i])) {
                             i += 1;
                         }
-                        // If no merge point, both arms terminate — remaining blocks are dead code
-                        if merge.is_none() && !skip.is_empty() && !else_skip.is_empty() {
+                        // If both arms terminate (no merge, or merge is a pure return relay),
+                        // remaining blocks are dead code.
+                        if (merge.is_none() || self.is_return_relay(func, merge))
+                            && !skip.is_empty() && !else_skip.is_empty()
+                        {
                             break;
                         }
                         continue;
@@ -803,7 +924,10 @@ impl<'a> CodeGenerator<'a> {
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
                 StructuredNode::While { header, condition, body, .. } => {
-                    // Emit header statements (before loop)
+                    if body.is_empty() {
+                        continue;
+                    }
+                    // Emit header statements (before loop — initial iteration)
                     if let Some(block) = func.block(*header) {
                         self.emit_stmts_only(&mut out, block);
                     }
@@ -811,6 +935,10 @@ impl<'a> CodeGenerator<'a> {
                     let _ = writeln!(out, "{}while ({}) {{", self.indent_str(), cond_str);
                     self.indent += 1;
                     out.push_str(&self.emit_structured(body, func));
+                    // Re-emit header statements at end of loop body (for next iteration)
+                    if let Some(block) = func.block(*header) {
+                        self.emit_stmts_only(&mut out, block);
+                    }
                     self.indent -= 1;
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
@@ -827,6 +955,7 @@ impl<'a> CodeGenerator<'a> {
     fn emit_block_full(&mut self, block: &BasicBlock, func: &Function) -> String {
         let mut out = String::new();
         let mut hit_noreturn = false;
+        let mut rax_return_expr = self.last_rax_assignment_expr(block);
 
         for stmt in &block.stmts {
             let line = self.stmt_to_c(stmt);
@@ -846,6 +975,10 @@ impl<'a> CodeGenerator<'a> {
         match &block.terminator {
             Terminator::Return(val) => {
                 let _ = match val {
+                    Some(Expr::Var(Var::Reg(RegId::Rax, _))) if rax_return_expr.is_some() => {
+                        let v = rax_return_expr.as_ref().expect("checked is_some");
+                        writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v))
+                    }
                     Some(v) => writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v)),
                     None => writeln!(out, "{}return;", self.indent_str()),
                 };
@@ -856,6 +989,9 @@ impl<'a> CodeGenerator<'a> {
                 if !tail.is_empty() {
                     for (idx, &tail_bid) in tail.iter().enumerate() {
                         if let Some(tail_block) = func.block(tail_bid) {
+                            if let Some(expr) = self.last_rax_assignment_expr(tail_block) {
+                                rax_return_expr = Some(expr);
+                            }
                             // Emit stmts for all blocks
                             self.emit_stmts_only(&mut out, tail_block);
                             if self.block_has_noreturn(tail_block) {
@@ -866,6 +1002,10 @@ impl<'a> CodeGenerator<'a> {
                                 match &tail_block.terminator {
                                     Terminator::Return(val) => {
                                         let _ = match val {
+                                            Some(Expr::Var(Var::Reg(RegId::Rax, _))) if rax_return_expr.is_some() => {
+                                                let v = rax_return_expr.as_ref().expect("checked is_some");
+                                                writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v))
+                                            }
                                             Some(v) => writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v)),
                                             None => writeln!(out, "{}return;", self.indent_str()),
                                         };
@@ -913,6 +1053,24 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    fn last_rax_assignment_expr(&self, block: &BasicBlock) -> Option<Expr> {
+        let mut last = None;
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Assign(Var::Reg(RegId::Rax, _), expr) => {
+                    last = Some(expr.clone());
+                }
+                Stmt::Call(Some(Var::Reg(RegId::Rax, _)), _, _) => {
+                    // Unknown concrete value here; keep previous explicit expression only
+                    // if a later Assign rewrites rax.
+                    last = None;
+                }
+                _ => {}
+            }
+        }
+        last
+    }
+
     // ── Statement/expression rendering ───────────────────────────
 
     fn is_noreturn_call(&self, stmt: &Stmt) -> bool {
@@ -927,9 +1085,21 @@ impl<'a> CodeGenerator<'a> {
     fn stmt_to_c(&self, stmt: &Stmt) -> String {
         match stmt {
             Stmt::Assign(var, expr) => {
-                // Suppress all register assignments — they're ABI noise
+                // Suppress all register assignments — they're ABI noise.
+                // Return-value recovery is handled by last_rax_assignment_expr.
                 if matches!(var, Var::Reg(_, _)) {
                     return String::new();
+                }
+                // Detect folded zero-init buffer: Var::Stack(off, Bit8) = Const(total, Bit64)
+                if let (Var::Stack(off, BitWidth::Bit8), Expr::Const(total, BitWidth::Bit64)) = (var, expr) {
+                    if *total >= 16 {
+                        let name = if *off >= 0 {
+                            format!("arg_{off:x}")
+                        } else {
+                            format!("var_{:x}", off.unsigned_abs())
+                        };
+                        return format!("memset(&{name}, 0, {total})");
+                    }
                 }
                 // Suppress parameter assignments (var_N = param_reg)
                 if let Var::Stack(off, _) = var {
@@ -999,12 +1169,12 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
                 // Character literal for byte/dword-sized printable ASCII
-                if matches!(width, BitWidth::Bit8 | BitWidth::Bit32) && *val >= 0x20 && *val <= 0x7e {
+                if matches!(width, BitWidth::Bit8) && *val >= 0x20 && *val <= 0x7e {
                     let ch = *val as u8 as char;
                     return format!("'{ch}'");
                 }
-                // Special characters
-                if *val == 0x0a {
+                // Special characters (only for byte-width)
+                if matches!(width, BitWidth::Bit8) && *val == 0x0a {
                     return "'\\n'".to_string();
                 }
                 // Common negative values: display as signed
@@ -1028,25 +1198,20 @@ impl<'a> CodeGenerator<'a> {
                         return self.expr_to_c(rhs);
                     }
                 }
-                // rbp + large_const → &var_N
-                if matches!(op, BinOp::Add) {
-                    if let Expr::Var(Var::Reg(RegId::Rbp, _)) = lhs.as_ref() {
-                        if let Expr::Const(val, _) = rhs.as_ref() {
-                            let offset = *val as i64;
-                            if offset < 0 {
-                                return format!("&var_{:x}", (-offset) as u64);
-                            } else if offset > 0 {
-                                return format!("&arg_{offset:x}");
-                            }
-                        }
-                    }
-                }
-                // rbp - const → &var_N
-                if matches!(op, BinOp::Sub) {
-                    if let Expr::Var(Var::Reg(RegId::Rbp, _)) = lhs.as_ref() {
-                        if let Expr::Const(val, _) = rhs.as_ref() {
-                            return format!("&var_{val:x}");
-                        }
+                // rbp-relative expressions → &var_N (simple) or (&var_N + dynamic)
+                if matches!(op, BinOp::Add | BinOp::Sub) {
+                    if let Some((offset, dynamic)) = self.extract_rbp_base(expr) {
+                        let base = if offset < 0 {
+                            format!("&var_{:x}", (-offset) as u64)
+                        } else if offset > 0 {
+                            format!("&arg_{offset:x}")
+                        } else {
+                            "rbp".to_string()
+                        };
+                        return match dynamic {
+                            Some(dyn_expr) => format!("({} + {})", base, self.expr_to_c(&dyn_expr)),
+                            None => base,
+                        };
                     }
                 }
                 let op_str = match op {
@@ -1076,6 +1241,9 @@ impl<'a> CodeGenerator<'a> {
                 UnaryOp::SignExt(w) => {
                     format!("({})(signed){}", c_type(*w), self.expr_to_c(inner))
                 }
+                UnaryOp::AddrOf => {
+                    format!("&{}", self.expr_to_c(inner))
+                }
             },
             Expr::Load(addr, width) => {
                 // Resolve rip-relative loads as globals/strings
@@ -1100,15 +1268,26 @@ impl<'a> CodeGenerator<'a> {
                         return name;
                     }
                 }
-                // Stack loads: *(type*)(rbp + offset) → var_N
-                if let Expr::BinOp(BinOp::Add, lhs, rhs) = addr.as_ref() {
-                    if let Expr::Var(Var::Reg(RegId::Rbp, _)) = lhs.as_ref() {
-                        if let Expr::Const(val, _) = rhs.as_ref() {
-                            let offset = *val as i64;
-                            if offset < 0 {
-                                return format!("var_{:x}", (-offset) as u64);
-                            }
+                // Stack loads: *(type*)(rbp + offset) → var_N / arg_N
+                if let Some((offset, dynamic)) = self.extract_rbp_base(addr) {
+                    if dynamic.is_none() {
+                        // Simple rbp + const → direct stack variable
+                        if offset < 0 {
+                            return format!("var_{:x}", (-offset) as u64);
+                        } else if offset > 0 {
+                            return format!("arg_{offset:x}");
                         }
+                    } else {
+                        // rbp + const + dynamic → *(type*)(&var_N + dynamic)
+                        let base = if offset < 0 {
+                            format!("&var_{:x}", (-offset) as u64)
+                        } else if offset > 0 {
+                            format!("&arg_{offset:x}")
+                        } else {
+                            "rbp".to_string()
+                        };
+                        let dyn_str = self.expr_to_c(dynamic.as_ref().unwrap());
+                        return format!("*({}*)(({} + {}))", c_type(*width), base, dyn_str);
                     }
                 }
                 format!("*({}*)({})", c_type(*width), self.expr_to_c(addr))
@@ -1139,6 +1318,73 @@ impl<'a> CodeGenerator<'a> {
                     CondCode::NotSign => ">=",
                 };
                 format!("{} {} {}", self.expr_to_c(lhs), op, self.expr_to_c(rhs))
+            }
+        }
+    }
+
+    /// Decompose an expression tree to extract `rbp + const_offset + dynamic_part`.
+    ///
+    /// Returns `Some((stack_offset_as_i64, Option<dynamic_expr>))` if the tree
+    /// contains `rbp` and additive constant(s).  The dynamic part is `None` when
+    /// the expression is a plain `rbp ± const`.
+    fn extract_rbp_base(&self, expr: &Expr) -> Option<(i64, Option<Expr>)> {
+        // Flatten the additive tree: collect (sign, node) pairs.
+        let mut const_sum: i64 = 0;
+        let mut dynamic_parts: Vec<Expr> = Vec::new();
+        let mut has_rbp = false;
+
+        self.flatten_add(expr, true, &mut const_sum, &mut dynamic_parts, &mut has_rbp);
+
+        if !has_rbp {
+            return None;
+        }
+
+        let dynamic = if dynamic_parts.is_empty() {
+            None
+        } else {
+            // Rebuild the dynamic expression as a sum
+            let mut acc = dynamic_parts.remove(0);
+            for part in dynamic_parts {
+                acc = Expr::binop(BinOp::Add, acc, part);
+            }
+            Some(acc)
+        };
+
+        Some((const_sum, dynamic))
+    }
+
+    /// Recursively flatten an additive expression tree.
+    /// Collects: constants into `const_sum`, `rbp` flag, everything else into `dynamic`.
+    fn flatten_add(
+        &self,
+        expr: &Expr,
+        positive: bool,
+        const_sum: &mut i64,
+        dynamic: &mut Vec<Expr>,
+        has_rbp: &mut bool,
+    ) {
+        match expr {
+            Expr::BinOp(BinOp::Add, lhs, rhs) => {
+                self.flatten_add(lhs, positive, const_sum, dynamic, has_rbp);
+                self.flatten_add(rhs, positive, const_sum, dynamic, has_rbp);
+            }
+            Expr::BinOp(BinOp::Sub, lhs, rhs) => {
+                self.flatten_add(lhs, positive, const_sum, dynamic, has_rbp);
+                self.flatten_add(rhs, !positive, const_sum, dynamic, has_rbp);
+            }
+            Expr::Var(Var::Reg(RegId::Rbp, _)) => {
+                *has_rbp = true;
+            }
+            Expr::Const(val, _) => {
+                let v = *val as i64;
+                if positive {
+                    *const_sum += v;
+                } else {
+                    *const_sum -= v;
+                }
+            }
+            _ => {
+                dynamic.push(expr.clone());
             }
         }
     }

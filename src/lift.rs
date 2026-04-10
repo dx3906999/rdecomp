@@ -142,7 +142,7 @@ impl Lifter {
             Mnemonic::Lea => self.lift_lea(insn),
             Mnemonic::Add => self.lift_arith(insn, BinOp::Add),
             Mnemonic::Sub => self.lift_sub(insn),
-            Mnemonic::Imul => self.lift_binop(insn, BinOp::Mul),
+            Mnemonic::Imul => self.lift_imul(insn),
             Mnemonic::Mul => self.lift_binop(insn, BinOp::Mul),
             Mnemonic::Idiv => self.lift_div(insn, true),
             Mnemonic::Div => self.lift_div(insn, false),
@@ -165,7 +165,8 @@ impl Lifter {
                 self.lift_setcc(insn)
             }
             Mnemonic::Cdqe => self.lift_cdqe(),
-            Mnemonic::Cdq | Mnemonic::Cqo => vec![],
+            Mnemonic::Cdq => self.lift_cdq_cqo(BitWidth::Bit32, 31),
+            Mnemonic::Cqo => self.lift_cdq_cqo(BitWidth::Bit64, 63),
             Mnemonic::Xchg => self.lift_xchg(insn),
             Mnemonic::Leave => vec![],
             Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Int3 => vec![],
@@ -393,6 +394,29 @@ impl Lifter {
         }
     }
 
+    /// Handle IMUL which can have 2 or 3 operands:
+    ///   imul dst, src       → dst = dst * src
+    ///   imul dst, src, imm  → dst = src * imm
+    fn lift_imul(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let op_count = insn.insn.op_count();
+        if op_count == 3 {
+            // 3-operand form: imul dst, src, imm
+            let dst = self.lift_operand_as_var(&insn.insn, 0);
+            let src = self.lift_operand(&insn.insn, 1);
+            let imm = self.lift_operand(&insn.insn, 2);
+            let result = Expr::binop(BinOp::Mul, src, imm);
+            match dst {
+                Some(var) => vec![Stmt::Assign(var, result)],
+                None => {
+                    let addr = self.lift_memory_operand(&insn.insn, 0);
+                    vec![Stmt::Store(addr, result, operand_width(&insn.insn, 0))]
+                }
+            }
+        } else {
+            self.lift_binop(insn, BinOp::Mul)
+        }
+    }
+
     fn lift_arith(&mut self, insn: &DisasmInsn, op: BinOp) -> Vec<Stmt> {
         let dst = self.lift_operand_as_var(&insn.insn, 0);
         let lhs = self.lift_operand(&insn.insn, 0);
@@ -527,6 +551,14 @@ impl Lifter {
         vec![Stmt::Assign(Var::Reg(RegId::Rax, BitWidth::Bit64), Expr::unaryop(UnaryOp::SignExt(BitWidth::Bit64), eax))]
     }
 
+    fn lift_cdq_cqo(&self, width: BitWidth, shift: u64) -> Vec<Stmt> {
+        let ax = Expr::var(Var::Reg(RegId::Rax, width));
+        vec![Stmt::Assign(
+            Var::Reg(RegId::Rdx, width),
+            Expr::binop(BinOp::Sar, ax, Expr::const_val(shift, BitWidth::Bit8)),
+        )]
+    }
+
     fn lift_xchg(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
         let a = self.lift_operand_as_var(&insn.insn, 0);
         let b = self.lift_operand_as_var(&insn.insn, 1);
@@ -594,6 +626,15 @@ impl Lifter {
     }
 
     fn lift_memory_operand(&self, insn: &iced_x86::Instruction, _op_idx: u32) -> Expr {
+        // Handle segment-prefixed memory accesses (e.g. fs:0x28 for stack canary)
+        let seg = insn.segment_prefix();
+        if matches!(seg, Register::FS | Register::GS) {
+            let disp = insn.memory_displacement64();
+            // Use a high sentinel: 0xFFFF_FFFF_FFFF_E000 + disp
+            // Easily recognizable in analysis passes.
+            return Expr::const_val(0xFFFF_FFFF_FFFF_E000u64.wrapping_add(disp), BitWidth::Bit64);
+        }
+
         let base = insn.memory_base();
         let index = insn.memory_index();
         let scale = insn.memory_index_scale();

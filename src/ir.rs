@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// Well-known functions that never return.
-pub const NORETURN_NAMES: &[&str] = &["exit", "_exit", "abort", "_Exit", "__assert_fail"];
+pub const NORETURN_NAMES: &[&str] = &["exit", "_exit", "abort", "_Exit", "__assert_fail", "__stack_chk_fail"];
 
 /// Check if a function name is a known noreturn function.
 pub fn is_noreturn_name(name: &str) -> bool {
@@ -208,6 +208,8 @@ pub enum UnaryOp {
     SignExt(BitWidth),
     /// Truncate to narrower type.
     Trunc(BitWidth),
+    /// Address-of operator (&).
+    AddrOf,
 }
 
 impl fmt::Display for UnaryOp {
@@ -218,6 +220,7 @@ impl fmt::Display for UnaryOp {
             Self::ZeroExt(w) => write!(f, "({})", w),
             Self::SignExt(w) => write!(f, "(signed {})", w),
             Self::Trunc(w) => write!(f, "({})", w),
+            Self::AddrOf => write!(f, "&"),
         }
     }
 }
@@ -255,6 +258,7 @@ impl Expr {
             },
             Self::UnaryOp(op, inner) => match op {
                 UnaryOp::ZeroExt(w) | UnaryOp::SignExt(w) | UnaryOp::Trunc(w) => *w,
+                UnaryOp::AddrOf => BitWidth::Bit64,
                 _ => inner.width(),
             },
             Self::Cond(_) | Self::Cmp(..) => BitWidth::Bit8,
