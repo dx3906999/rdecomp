@@ -28,6 +28,9 @@ pub enum DecompError {
 
     #[error("analysis error: {0}")]
     AnalysisError(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, DecompError>;

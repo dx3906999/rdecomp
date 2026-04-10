@@ -6,6 +6,20 @@ use iced_x86::{Mnemonic, OpKind, Register};
 use iced_x86::ConditionCode as IcedCC;
 use std::collections::BTreeMap;
 
+/// Get the memory displacement as a correctly sign-extended i64.
+/// For 32-bit address modes the displacement is only 32 bits; using
+/// `memory_displacement64()` zero-extends it, so e.g. `[ebp-0x10]`
+/// yields `0x00000000FFFFFFF0` instead of `-16`.  We use the displacement
+/// size to decide how to sign-extend.
+fn mem_disp_signed(insn: &iced_x86::Instruction) -> i64 {
+    let ds = insn.memory_displ_size();
+    if ds <= 4 {
+        insn.memory_displacement32() as i32 as i64
+    } else {
+        insn.memory_displacement64() as i64
+    }
+}
+
 /// Tracks the last CMP/TEST operands for condition fusion.
 #[derive(Debug, Clone)]
 struct FlagState {
@@ -46,6 +60,16 @@ impl Lifter {
 
     pub fn set_calling_conv(&mut self, cc: CallingConv) {
         self.calling_conv = cc;
+    }
+
+    /// Pointer width for the current architecture.
+    fn ptr_width(&self) -> BitWidth {
+        if self.calling_conv.is_32bit() { BitWidth::Bit32 } else { BitWidth::Bit64 }
+    }
+
+    /// Pointer size in bytes.
+    fn ptr_size(&self) -> u64 {
+        if self.calling_conv.is_32bit() { 4 } else { 8 }
     }
 
     fn new_temp(&mut self, width: BitWidth) -> Var {
@@ -237,7 +261,8 @@ impl Lifter {
     ) -> Terminator {
         match insn.insn.flow_control() {
             iced_x86::FlowControl::Return => {
-                Terminator::Return(Some(Expr::var(Var::Reg(RegId::Rax, BitWidth::Bit64))))
+                let ret_w = if self.calling_conv.is_32bit() { BitWidth::Bit32 } else { BitWidth::Bit64 };
+                Terminator::Return(Some(Expr::var(Var::Reg(RegId::Rax, ret_w))))
             }
             iced_x86::FlowControl::UnconditionalBranch => {
                 if let Some(target) = insn.branch_target() {
@@ -317,20 +342,24 @@ impl Lifter {
 
     fn lift_push(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
         let val = self.lift_operand(&insn.insn, 0);
-        let rsp = Var::Reg(RegId::Rsp, BitWidth::Bit64);
+        let pw = self.ptr_width();
+        let ps = self.ptr_size();
+        let rsp = Var::Reg(RegId::Rsp, pw);
         vec![
-            Stmt::Assign(rsp.clone(), Expr::binop(BinOp::Sub, Expr::var(rsp.clone()), Expr::const_val(8, BitWidth::Bit64))),
-            Stmt::Store(Expr::var(rsp), val, BitWidth::Bit64),
+            Stmt::Assign(rsp.clone(), Expr::binop(BinOp::Sub, Expr::var(rsp.clone()), Expr::const_val(ps, pw))),
+            Stmt::Store(Expr::var(rsp), val, pw),
         ]
     }
 
     fn lift_pop(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
-        let rsp = Var::Reg(RegId::Rsp, BitWidth::Bit64);
+        let pw = self.ptr_width();
+        let ps = self.ptr_size();
+        let rsp = Var::Reg(RegId::Rsp, pw);
         let mut stmts = Vec::new();
         if let Some(dst) = self.lift_operand_as_var(&insn.insn, 0) {
-            stmts.push(Stmt::Assign(dst, Expr::load(Expr::var(rsp.clone()), BitWidth::Bit64)));
+            stmts.push(Stmt::Assign(dst, Expr::load(Expr::var(rsp.clone()), pw)));
         }
-        stmts.push(Stmt::Assign(rsp.clone(), Expr::binop(BinOp::Add, Expr::var(rsp), Expr::const_val(8, BitWidth::Bit64))));
+        stmts.push(Stmt::Assign(rsp.clone(), Expr::binop(BinOp::Add, Expr::var(rsp), Expr::const_val(ps, pw))));
         stmts
     }
 
@@ -531,11 +560,12 @@ impl Lifter {
 
     fn lift_call(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
         let target = if let Some(addr) = insn.branch_target() {
-            Expr::const_val(addr, BitWidth::Bit64)
+            Expr::const_val(addr, self.ptr_width())
         } else {
             self.lift_operand(&insn.insn, 0)
         };
-        let ret = Var::Reg(RegId::Rax, BitWidth::Bit64);
+        let ret_w = if self.calling_conv.is_32bit() { BitWidth::Bit32 } else { BitWidth::Bit64 };
+        let ret = Var::Reg(RegId::Rax, ret_w);
         let args: Vec<Expr> = self
             .calling_conv
             .param_regs()
@@ -610,12 +640,12 @@ impl Lifter {
             OpKind::Memory => {
                 let base = insn.memory_base();
                 if matches!(base, Register::RBP | Register::EBP) {
-                    let disp = insn.memory_displacement64() as i64;
+                    let disp = mem_disp_signed(insn);
                     Some(Var::Stack(disp, operand_width(insn, op_idx)))
                 } else if matches!(base, Register::RSP | Register::ESP)
                     && insn.memory_index() == Register::None
                 {
-                    let disp = insn.memory_displacement64() as i64;
+                    let disp = mem_disp_signed(insn);
                     Some(Var::Stack(-(self.frame_size as i64) + disp, operand_width(insn, op_idx)))
                 } else {
                     None
@@ -638,7 +668,7 @@ impl Lifter {
         let base = insn.memory_base();
         let index = insn.memory_index();
         let scale = insn.memory_index_scale();
-        let disp = insn.memory_displacement64();
+        let pw = self.ptr_width();
 
         let mut addr: Option<Expr> = None;
 
@@ -649,7 +679,7 @@ impl Lifter {
         if index != Register::None {
             let (r, w) = map_register(index);
             let ix = if scale > 1 {
-                Expr::binop(BinOp::Mul, Expr::var(Var::Reg(r, w)), Expr::const_val(scale as u64, BitWidth::Bit64))
+                Expr::binop(BinOp::Mul, Expr::var(Var::Reg(r, w)), Expr::const_val(scale as u64, pw))
             } else {
                 Expr::var(Var::Reg(r, w))
             };
@@ -658,14 +688,31 @@ impl Lifter {
                 None => ix,
             });
         }
-        if disp != 0 {
-            let d = Expr::const_val(disp, BitWidth::Bit64);
+        let disp_signed = mem_disp_signed(insn);
+        if disp_signed != 0 {
+            // For the Expr node, store the displacement as its unsigned representation
+            // at the correct pointer width, so that extract_stack_offset can sign-extend
+            // it properly.
+            let (disp_val, disp_width) = if pw == BitWidth::Bit32 {
+                ((disp_signed as i32 as u32) as u64, BitWidth::Bit32)
+            } else {
+                (disp_signed as u64, BitWidth::Bit64)
+            };
+            let d = Expr::const_val(disp_val, disp_width);
             addr = Some(match addr {
-                Some(a) => Expr::binop(BinOp::Add, a, d),
+                Some(a) => {
+                    if disp_signed < 0 {
+                        // Represent as Sub for cleaner analysis
+                        let abs_val = disp_signed.unsigned_abs();
+                        Expr::binop(BinOp::Sub, a, Expr::const_val(abs_val, disp_width))
+                    } else {
+                        Expr::binop(BinOp::Add, a, d)
+                    }
+                }
                 None => d,
             });
         }
-        addr.unwrap_or_else(|| Expr::const_val(0, BitWidth::Bit64))
+        addr.unwrap_or_else(|| Expr::const_val(0, pw))
     }
 
     fn map_condition_code(cc: IcedCC) -> CondCode {

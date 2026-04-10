@@ -6,6 +6,7 @@ use rdecomp::disasm;
 use rdecomp::ir::CallingConv;
 use rdecomp::lift::Lifter;
 use rdecomp::loader::Binary;
+use rdecomp::project::{AnalyzedFunction, ProjectDb, hash_bytes};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -42,6 +43,12 @@ struct Cli {
     /// Maximum bytes to disassemble per function (default: 65536).
     #[arg(long, default_value_t = 65536)]
     max_size: u64,
+
+    /// Use/create a project file (.rdb) to cache analysis results.
+    /// The project file is stored next to the binary with a .rdb extension
+    /// unless an explicit path is given.
+    #[arg(short, long)]
+    project: bool,
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -75,6 +82,37 @@ fn main() {
             .join(", ")
     );
     println!("Functions detected: {}", binary.functions.len());
+
+    // --- Project file handling ---
+    let rdb_path = cli.binary.with_extension("rdb");
+    let mut project: Option<ProjectDb> = if cli.project {
+        if rdb_path.exists() {
+            match ProjectDb::open(&rdb_path) {
+                Ok(p) => {
+                    eprintln!("Project loaded: {} ({} cached functions)",
+                        rdb_path.display(), p.cached_count());
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not open project file, creating new: {e}");
+                    Some(ProjectDb::create(
+                        &rdb_path,
+                        &cli.binary.to_string_lossy(),
+                        &binary,
+                    ))
+                }
+            }
+        } else {
+            eprintln!("Creating project: {}", rdb_path.display());
+            Some(ProjectDb::create(
+                &rdb_path,
+                &cli.binary.to_string_lossy(),
+                &binary,
+            ))
+        }
+    } else {
+        None
+    };
 
     if cli.list_functions {
         println!("\nFunctions:");
@@ -110,7 +148,6 @@ fn main() {
             .unwrap_or_else(|| format!("sub_{addr:x}"));
         vec![(name, addr, 0)]
     } else if !binary.functions.is_empty() {
-        // Decompile all functions
         binary
             .functions
             .iter()
@@ -118,7 +155,6 @@ fn main() {
             .map(|f| (f.name.clone(), f.addr, f.size))
             .collect()
     } else {
-        // Fallback: decompile from entry point
         vec![(
             "entry".to_string(),
             binary.entry_point,
@@ -132,19 +168,22 @@ fn main() {
     }
 
     let mut lifter = Lifter::new(binary.arch);
-    // PE/Win64 calling convention vs SystemV for ELF
-    if binary.format == rdecomp::loader::BinaryFormat::Pe {
-        lifter.set_calling_conv(CallingConv::Win64);
+    match (binary.arch, binary.format) {
+        (rdecomp::loader::Arch::X86, _) => lifter.set_calling_conv(CallingConv::Cdecl),
+        (_, rdecomp::loader::BinaryFormat::Pe) => lifter.set_calling_conv(CallingConv::Win64),
+        _ => {}
     }
     let mut codegen = CodeGenerator::new(&binary.functions, &binary);
 
-    // Build set of known noreturn function addresses from PLT
     let noreturn_addrs: HashSet<u64> = binary
         .plt_map
         .iter()
         .filter(|(_, name)| rdecomp::ir::is_noreturn_name(name))
         .map(|(addr, _)| *addr)
         .collect();
+
+    let mut cache_hits = 0u32;
+    let mut cache_misses = 0u32;
 
     for (name, addr, size) in &targets {
         println!("\n{}", "=".repeat(60));
@@ -154,7 +193,6 @@ fn main() {
         let func_size = if *size > 0 {
             *size
         } else {
-            // Infer size from the next known function
             binary
                 .functions
                 .iter()
@@ -164,6 +202,25 @@ fn main() {
                 .map(|next| next - addr)
                 .unwrap_or(cli.max_size)
         };
+
+        let func_size_usize = usize::try_from(func_size).unwrap_or(cli.max_size as usize);
+
+        // Compute hash of raw bytes for cache validation
+        let bytes_hash = binary.read_bytes(*addr, func_size_usize)
+            .map(|b| hash_bytes(b));
+
+        // --- Try cache hit (only for normal C output mode) ---
+        if !cli.ir && !cli.disasm && !cli.no_opt {
+            if let Some(ref proj) = project {
+                if let Some(hash) = bytes_hash {
+                    if let Some(cached) = proj.get(*addr, hash) {
+                        println!("{}", cached.c_code);
+                        cache_hits += 1;
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Step 1: Disassemble
         let instructions = match disasm::disassemble_function(&binary, *addr, func_size) {
@@ -209,6 +266,34 @@ fn main() {
         // Step 5: Generate pseudo-C
         let code = codegen.generate(&func, &cfg);
         println!("{code}");
+
+        // Step 6: Cache the result
+        if !cli.no_opt {
+            if let Some(ref mut proj) = project {
+                if let Some(hash) = bytes_hash {
+                    proj.insert(*addr, AnalyzedFunction {
+                        ir: func,
+                        c_code: code,
+                        bytes_hash: hash,
+                    });
+                    cache_misses += 1;
+                }
+            }
+        }
+    }
+
+    // Save project if dirty
+    if let Some(ref mut proj) = project {
+        if proj.is_dirty() {
+            if let Err(e) = proj.save() {
+                eprintln!("Warning: could not save project file: {e}");
+            } else {
+                eprintln!("Project saved: {} (hits={}, misses={}, total cached={})",
+                    proj.project_path().display(), cache_hits, cache_misses, proj.cached_count());
+            }
+        } else if cache_hits > 0 {
+            eprintln!("Project: all {} functions served from cache", cache_hits);
+        }
     }
 }
 

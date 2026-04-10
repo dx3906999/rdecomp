@@ -1,11 +1,12 @@
 use crate::error::{DecompError, Result};
 use goblin::Object;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
 /// Represents an executable section loaded from a binary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Section {
     pub name: String,
     pub vaddr: u64,
@@ -14,7 +15,7 @@ pub struct Section {
 }
 
 /// A detected function symbol with name and address.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionSymbol {
     pub name: String,
     pub addr: u64,
@@ -22,14 +23,14 @@ pub struct FunctionSymbol {
 }
 
 /// Target architecture of the loaded binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Arch {
     X86,
     X86_64,
 }
 
 /// Binary format type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryFormat {
     Elf,
     Pe,
@@ -212,17 +213,54 @@ impl Binary {
         }
 
         let mut functions = Vec::new();
-        for export in &pe.exports {
-            if let Some(name) = &export.name {
-                functions.push(FunctionSymbol {
-                    name: name.to_string(),
-                    addr: image_base + export.rva as u64,
-                    size: 0,
-                });
+
+        // Extract functions from .pdata (exception data) — PE64 only.
+        // Each RuntimeFunction entry has begin_address and end_address RVAs.
+        if let Some(ref exc) = pe.exception_data {
+            let mut known: HashSet<u64> = HashSet::new();
+            for result in exc.functions() {
+                if let Ok(rf) = result {
+                    let addr = image_base + u64::from(rf.begin_address);
+                    let size = u64::from(rf.end_address.saturating_sub(rf.begin_address));
+                    if size > 0 && known.insert(addr) {
+                        functions.push(FunctionSymbol {
+                            name: format!("sub_{addr:x}"),
+                            addr,
+                            size,
+                        });
+                    }
+                }
             }
         }
 
+        // Also add exported functions (these have real names).
+        for export in &pe.exports {
+            if let Some(name) = &export.name {
+                let addr = image_base + export.rva as u64;
+                // If we already have this address from .pdata, update its name.
+                if let Some(existing) = functions.iter_mut().find(|f| f.addr == addr) {
+                    existing.name = name.to_string();
+                } else {
+                    functions.push(FunctionSymbol {
+                        name: name.to_string(),
+                        addr,
+                        size: 0,
+                    });
+                }
+            }
+        }
+
+        // Import thunks — these are indirect calls to DLL functions.
+        // The IAT entries themselves aren't code, but the import names
+        // are useful for resolving call targets.
+        let mut plt_map = std::collections::HashMap::new();
+        for import in &pe.imports {
+            let addr = image_base + import.rva as u64;
+            plt_map.insert(addr, import.name.to_string());
+        }
+
         functions.sort_by_key(|f| f.addr);
+        functions.dedup_by_key(|f| f.addr);
 
         Ok(Binary {
             arch,
@@ -231,7 +269,7 @@ impl Binary {
             sections,
             functions,
             base_address: image_base,
-            plt_map: std::collections::HashMap::new(),
+            plt_map,
             globals_map: std::collections::HashMap::new(),
         })
     }
@@ -523,6 +561,23 @@ impl Binary {
         }
         // push ebp; mov ebp, esp (55 89 E5)
         if bitness == 32 && bytes[0..3] == [0x55, 0x89, 0xE5] {
+            return true;
+        }
+        // MSVC x64: sub rsp, imm8 (48 83 EC xx) — common leaf/small frame
+        if bitness == 64 && bytes.len() >= 4 && bytes[0..3] == [0x48, 0x83, 0xEC] {
+            return true;
+        }
+        // MSVC x64: sub rsp, imm32 (48 81 EC xx xx xx xx) — larger frames
+        if bitness == 64 && bytes.len() >= 7 && bytes[0..3] == [0x48, 0x81, 0xEC] {
+            return true;
+        }
+        // MSVC x64: mov [rsp+8], rcx (48 89 4C 24 08) — home parameter before sub rsp
+        if bitness == 64 && bytes.len() >= 5 && bytes[0..5] == [0x48, 0x89, 0x4C, 0x24, 0x08] {
+            return true;
+        }
+        // MSVC: push rbx (53), push rdi (57), push rsi (56) — callee-saved reg prologue
+        // Only count as prologue for 32-bit (for 64-bit, too ambiguous alone)
+        if bitness == 32 && matches!(bytes[0], 0x53 | 0x56 | 0x57) && bytes[1] == 0x8B {
             return true;
         }
         false

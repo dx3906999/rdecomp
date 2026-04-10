@@ -6,5 +6,6 @@ pub mod error;
 pub mod ir;
 pub mod lift;
 pub mod loader;
+pub mod project;
 
 pub use error::{DecompError, Result};

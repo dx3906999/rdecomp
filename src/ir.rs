@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 /// Well-known functions that never return.
@@ -9,7 +11,7 @@ pub fn is_noreturn_name(name: &str) -> bool {
 }
 
 /// Bit width for values and operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum BitWidth {
     Bit8,
     Bit16,
@@ -44,7 +46,7 @@ impl fmt::Display for BitWidth {
 }
 
 /// CPU register identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RegId {
     // General-purpose 64-bit
     Rax,
@@ -93,7 +95,7 @@ impl fmt::Display for RegId {
 }
 
 /// CPU flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Flag {
     Zf, // Zero flag
     Sf, // Sign flag
@@ -113,7 +115,7 @@ impl fmt::Display for Flag {
 }
 
 /// A variable in the IR.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Var {
     /// CPU register (possibly sub-register with a width).
     Reg(RegId, BitWidth),
@@ -152,7 +154,7 @@ impl fmt::Display for Var {
 }
 
 /// Binary operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -198,7 +200,7 @@ impl fmt::Display for BinOp {
 }
 
 /// Unary operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -226,7 +228,7 @@ impl fmt::Display for UnaryOp {
 }
 
 /// An expression in the IR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// A variable reference.
     Var(Var),
@@ -311,7 +313,7 @@ impl fmt::Display for Expr {
 }
 
 /// Condition codes for branches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CondCode {
     Eq,   // ZF=1
     Ne,   // ZF=0
@@ -366,7 +368,7 @@ impl fmt::Display for CondCode {
 }
 
 /// A statement in the IR.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
     /// Assign a value to a variable.
     Assign(Var, Expr),
@@ -402,7 +404,7 @@ impl fmt::Display for Stmt {
 }
 
 /// Terminator of a basic block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Terminator {
     /// Unconditional jump to a block.
     Jump(BlockId),
@@ -435,7 +437,7 @@ impl fmt::Display for Terminator {
 }
 
 /// Block identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
 impl fmt::Display for BlockId {
@@ -445,12 +447,14 @@ impl fmt::Display for BlockId {
 }
 
 /// Calling convention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallingConv {
     /// System V AMD64 ABI (Linux/macOS): rdi, rsi, rdx, rcx, r8, r9.
     SystemV,
     /// Microsoft x64: rcx, rdx, r8, r9.
     Win64,
+    /// x86 cdecl: all parameters on stack, return in eax.
+    Cdecl,
 }
 
 impl CallingConv {
@@ -459,6 +463,7 @@ impl CallingConv {
         match self {
             Self::SystemV => &[RegId::Rdi, RegId::Rsi, RegId::Rdx, RegId::Rcx, RegId::R8, RegId::R9],
             Self::Win64 => &[RegId::Rcx, RegId::Rdx, RegId::R8, RegId::R9],
+            Self::Cdecl => &[],
         }
     }
 
@@ -467,12 +472,18 @@ impl CallingConv {
         match self {
             Self::SystemV => &[RegId::Rbx, RegId::Rbp, RegId::R12, RegId::R13, RegId::R14, RegId::R15],
             Self::Win64 => &[RegId::Rbx, RegId::Rbp, RegId::Rdi, RegId::Rsi, RegId::R12, RegId::R13, RegId::R14, RegId::R15],
+            Self::Cdecl => &[RegId::Rbx, RegId::Rsi, RegId::Rdi, RegId::Rbp],
         }
+    }
+
+    /// Whether this is a 32-bit calling convention.
+    pub fn is_32bit(&self) -> bool {
+        matches!(self, Self::Cdecl)
     }
 }
 
 /// A basic block in the IR.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasicBlock {
     pub id: BlockId,
     /// Original address of the first instruction in this block.
@@ -494,7 +505,7 @@ impl fmt::Display for BasicBlock {
 }
 
 /// A function in the IR.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
     pub addr: u64,
@@ -509,6 +520,10 @@ pub struct Function {
     pub has_frame_pointer: bool,
     /// Stack frame size (sub rsp, N).
     pub frame_size: u64,
+    /// Inferred buffer sizes: stack offset → byte count.
+    /// Populated by `infer_buffer_sizes` analysis pass.
+    #[serde(default)]
+    pub buffer_sizes: HashMap<i64, u64>,
 }
 
 impl Function {
@@ -524,6 +539,7 @@ impl Function {
             param_count: 0,
             has_frame_pointer: false,
             frame_size: 0,
+            buffer_sizes: HashMap::new(),
         }
     }
 

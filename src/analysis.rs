@@ -44,6 +44,7 @@ pub fn optimize(func: &mut Function, noreturn_addrs: &HashSet<u64>) {
     eliminate_self_assignments(func);
     promote_callee_saved_to_locals(func);
     fold_zero_init_buffers(func);
+    infer_buffer_sizes(func);
     simplify_void_returns(func);
 }
 
@@ -262,6 +263,81 @@ fn fold_zero_init_buffers(func: &mut Function) {
             }
         }
     }
+}
+
+// ── Buffer size inference ────────────────────────────────────────
+
+/// Infer stack buffer sizes from usage evidence.
+///
+/// Sources of evidence:
+/// 1. Folded zero-init markers: `Assign(Stack(off, Bit8), Const(total, Bit64))` with total >= 16
+/// 2. Call arguments: when `&var_XX` appears alongside a constant size argument,
+///    e.g. `memset(&buf, 0, 64)`, `read(fd, &buf, 80)`, `fgets(&buf, 64, stream)`.
+///
+/// For each stack offset, records the **maximum** size seen across all evidence.
+fn infer_buffer_sizes(func: &mut Function) {
+    let mut sizes: HashMap<i64, u64> = HashMap::new();
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                // Source 1: folded zero-init marker (local variables only)
+                Stmt::Assign(Var::Stack(off, BitWidth::Bit8), Expr::Const(total, BitWidth::Bit64))
+                    if *total >= 16 && *off < 0 =>
+                {
+                    let entry = sizes.entry(*off).or_insert(0);
+                    *entry = (*entry).max(*total);
+                }
+                // Source 2: call with &var_XX and a constant size arg
+                Stmt::Call(_, _, args) => {
+                    // Collect all local stack buffer references from AddrOf args
+                    let buf_offsets: Vec<i64> = args
+                        .iter()
+                        .filter_map(|a| {
+                            if let Expr::UnaryOp(UnaryOp::AddrOf, inner) = a {
+                                if let Expr::Var(Var::Stack(off, BitWidth::Bit8)) = inner.as_ref()
+                                {
+                                    if *off < 0 {
+                                        return Some(*off);
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+
+                    if buf_offsets.is_empty() {
+                        continue;
+                    }
+
+                    // Collect all constant values from other args as candidate sizes
+                    let const_vals: Vec<u64> = args
+                        .iter()
+                        .filter_map(|a| {
+                            if let Expr::Const(v, _) = a {
+                                // Filter out unlikely sizes: 0, very small, or huge values
+                                if *v >= 2 && *v <= 0x10000 {
+                                    return Some(*v);
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+
+                    // Associate each buffer with the max constant size in this call
+                    if let Some(&max_size) = const_vals.iter().max() {
+                        for off in &buf_offsets {
+                            let entry = sizes.entry(*off).or_insert(0);
+                            *entry = (*entry).max(max_size);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    func.buffer_sizes = sizes;
 }
 
 // ── Cross-block dataflow ─────────────────────────────────────────
@@ -948,7 +1024,7 @@ fn stack_variable_recovery(func: &mut Function) -> bool {
     }
 
     // Replace stack memory accesses with stack variables
-    if !stack_vars.is_empty() {
+    {
         for block in &mut func.blocks {
             for stmt in &mut block.stmts {
                 if replace_stack_refs(stmt) {
@@ -1001,8 +1077,8 @@ fn extract_stack_offset(expr: &Expr) -> Option<i64> {
                 lhs.as_ref(),
                 Expr::Var(Var::Reg(RegId::Rbp, _)) | Expr::Var(Var::Reg(RegId::Rsp, _))
             ) {
-                if let Expr::Const(val, _) = rhs.as_ref() {
-                    return Some(*val as i64);
+                if let Expr::Const(val, w) = rhs.as_ref() {
+                    return Some(sign_extend_offset(*val, *w));
                 }
             }
             None
@@ -1012,13 +1088,25 @@ fn extract_stack_offset(expr: &Expr) -> Option<i64> {
                 lhs.as_ref(),
                 Expr::Var(Var::Reg(RegId::Rbp, _)) | Expr::Var(Var::Reg(RegId::Rsp, _))
             ) {
-                if let Expr::Const(val, _) = rhs.as_ref() {
-                    return Some(-(*val as i64));
+                if let Expr::Const(val, w) = rhs.as_ref() {
+                    return Some(-sign_extend_offset(*val, *w));
                 }
             }
             None
         }
         _ => None,
+    }
+}
+
+/// Sign-extend a constant from its declared width to i64.
+/// On x86, `ebp + 0xfffffff0` stores `0xfffffff0` as a Bit32 constant
+/// which should be interpreted as `-16` (i32), not `4294967280` (u64).
+fn sign_extend_offset(val: u64, width: BitWidth) -> i64 {
+    match width {
+        BitWidth::Bit8 => val as i8 as i64,
+        BitWidth::Bit16 => val as i16 as i64,
+        BitWidth::Bit32 => val as i32 as i64,
+        BitWidth::Bit64 => val as i64,
     }
 }
 

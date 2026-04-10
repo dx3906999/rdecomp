@@ -1,6 +1,6 @@
 [package]
 name = "rdecomp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,8 @@ petgraph = "0.7"        # Graph data structures for CFG
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
 
 [profile.release]
 opt-level = 3

@@ -16,6 +16,11 @@ pub struct CodeGenerator<'a> {
     /// Temp vars that hold call results (temp_name → call expression string).
     /// Used to inline `t0 >= 0` as `seccomp_rule_add(...) >= 0`.
     call_results: HashMap<String, String>,
+    /// Inferred buffer sizes: stack offset → byte count.
+    /// Set per-function from `Function::buffer_sizes`.
+    buffer_sizes: HashMap<i64, u64>,
+    /// Per-function name mapping: stack offset → friendly name (e.g. `var_1`, `arg_1`).
+    var_names: HashMap<i64, String>,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -30,6 +35,8 @@ impl<'a> CodeGenerator<'a> {
             indent: 0,
             param_vars: HashSet::new(),
             call_results: HashMap::new(),
+            buffer_sizes: HashMap::new(),
+            var_names: HashMap::new(),
         }
     }
 
@@ -37,32 +44,98 @@ impl<'a> CodeGenerator<'a> {
     pub fn generate(&mut self, func: &Function, cfg: &Cfg) -> String {
         let mut out = String::new();
 
-        // Detect function parameters from entry block: stack_var = param_reg assignments
-        let param_regs = func.calling_conv.param_regs();
-        let mut params: Vec<(String, BitWidth)> = Vec::new();
-        let mut param_var_names: HashSet<String> = HashSet::new();
+        self.buffer_sizes = func.buffer_sizes.clone();
+        self.var_names.clear();
 
-        if let Some(entry) = func.blocks.first() {
-            for stmt in &entry.stmts {
-                if let Stmt::Assign(Var::Stack(off, w), Expr::Var(Var::Reg(reg, _))) = stmt {
-                    if param_regs.contains(reg) {
-                        let name = if *off >= 0 {
-                            format!("arg_{off:x}")
-                        } else {
-                            format!("var_{:x}", off.unsigned_abs())
-                        };
-                        params.push((name.clone(), *w));
-                        param_var_names.insert(name);
+        // ── Detect parameter offsets ─────────────────────────────
+        let param_regs = func.calling_conv.param_regs();
+        // param_offsets: BTreeSet of (offset, width) for stack slots that are parameters
+        let mut param_offsets: BTreeSet<(i64, BitWidth)> = BTreeSet::new();
+
+        if func.calling_conv.is_32bit() {
+            let mut positive_offs: BTreeSet<(i64, BitWidth)> = BTreeSet::new();
+            for block in &func.blocks {
+                for stmt in &block.stmts {
+                    Self::collect_stack_param_candidates(stmt, &mut positive_offs);
+                }
+                Self::collect_stack_param_candidates_from_term(&block.terminator, &mut positive_offs);
+            }
+            for item in positive_offs {
+                if item.0 > 4 {
+                    param_offsets.insert(item);
+                }
+            }
+        } else {
+            if let Some(entry) = func.blocks.first() {
+                for stmt in &entry.stmts {
+                    if let Stmt::Assign(Var::Stack(off, w), Expr::Var(Var::Reg(reg, _))) = stmt {
+                        if param_regs.contains(reg) {
+                            param_offsets.insert((*off, *w));
+                        }
                     }
                 }
             }
+        }
+
+        // ── Collect all stack offsets used in the function ────────
+        let mut all_offsets: BTreeMap<i64, BitWidth> = BTreeMap::new();
+        for (off, w) in &param_offsets {
+            all_offsets.entry(*off).or_insert(*w);
+        }
+        // Scan statements for assigned/used stack vars
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                let var = match stmt {
+                    Stmt::Assign(v, _) => Some(v),
+                    Stmt::Call(Some(v), _, _) => Some(v),
+                    _ => None,
+                };
+                if let Some(Var::Stack(off, w)) = var {
+                    all_offsets.entry(*off).or_insert(*w);
+                }
+            }
+        }
+
+        // ── Build friendly name map ──────────────────────────────
+        let param_off_set: HashSet<i64> = param_offsets.iter().map(|(o, _)| *o).collect();
+
+        // Parameters: sorted by offset ascending → arg_1, arg_2, ...
+        let mut param_list: Vec<(i64, BitWidth)> = param_offsets.iter().copied().collect();
+        param_list.sort_by_key(|(off, _)| *off);
+        for (i, (off, _w)) in param_list.iter().enumerate() {
+            self.var_names.insert(*off, format!("arg_{}", i + 1));
+        }
+
+        // Locals: negative offsets sorted by absolute value ascending → var_1, var_2, ...
+        let mut local_offs: Vec<(i64, BitWidth)> = all_offsets.iter()
+            .filter(|(off, _)| !param_off_set.contains(off))
+            .map(|(off, w)| (*off, *w))
+            .collect();
+        local_offs.sort_by_key(|(off, _)| off.unsigned_abs());
+        for (i, (off, _w)) in local_offs.iter().enumerate() {
+            self.var_names.insert(*off, format!("var_{}", i + 1));
+        }
+
+        // ── Build params and param_var_names ─────────────────────
+        let mut params: Vec<(String, BitWidth)> = Vec::new();
+        let mut param_var_names: HashSet<String> = HashSet::new();
+        for (off, w) in &param_list {
+            let name = self.stack_name(*off);
+            param_var_names.insert(name.clone());
+            params.push((name, *w));
         }
 
         // Determine return type: void if all returns carry no value
         let is_void = func.blocks.iter().all(|b| {
             !matches!(&b.terminator, Terminator::Return(Some(_)))
         });
-        let ret_type = if is_void { "void" } else { "uint64_t" };
+        let ret_type = if is_void {
+            "void"
+        } else if func.calling_conv.is_32bit() {
+            "uint32_t"
+        } else {
+            "uint64_t"
+        };
 
         // Function signature with parameters
         if params.is_empty() {
@@ -82,10 +155,14 @@ impl<'a> CodeGenerator<'a> {
         let locals = self.collect_locals(func);
         if !locals.is_empty() {
             let filtered: Vec<_> = locals.iter()
-                .filter(|(name, _)| !param_var_names.contains(name))
+                .filter(|(name, _, _)| !param_var_names.contains(name))
                 .collect();
-            for (name, width) in &filtered {
-                let _ = writeln!(out, "{}{}  {};", self.indent_str(), c_type(*width), name);
+            for (name, width, buf_size) in &filtered {
+                if let Some(size) = buf_size {
+                    let _ = writeln!(out, "{}char  {}[{}];", self.indent_str(), name, size);
+                } else {
+                    let _ = writeln!(out, "{}{}  {};", self.indent_str(), c_type(*width), name);
+                }
             }
             if !filtered.is_empty() {
                 let _ = writeln!(out);
@@ -123,9 +200,57 @@ impl<'a> CodeGenerator<'a> {
         "    ".repeat(self.indent)
     }
 
+    /// Collect positive stack offset references from a statement (for x86 cdecl params).
+    fn collect_stack_param_candidates(stmt: &Stmt, out: &mut BTreeSet<(i64, BitWidth)>) {
+        match stmt {
+            Stmt::Assign(Var::Stack(off, w), _) => {
+                if *off > 4 {
+                    out.insert((*off, *w));
+                }
+            }
+            _ => {}
+        }
+        // Also check expressions within (e.g. reads of arg_8)
+        Self::collect_stack_param_candidates_from_expr(
+            match stmt {
+                Stmt::Assign(_, expr) => Some(expr),
+                _ => None,
+            },
+            out,
+        );
+    }
+
+    fn collect_stack_param_candidates_from_term(term: &Terminator, out: &mut BTreeSet<(i64, BitWidth)>) {
+        match term {
+            Terminator::Branch(cond, _, _) => Self::collect_stack_param_candidates_from_expr(Some(cond), out),
+            Terminator::Return(Some(val)) => Self::collect_stack_param_candidates_from_expr(Some(val), out),
+            _ => {}
+        }
+    }
+
+    fn collect_stack_param_candidates_from_expr(expr: Option<&Expr>, out: &mut BTreeSet<(i64, BitWidth)>) {
+        let Some(expr) = expr else { return };
+        match expr {
+            Expr::Var(Var::Stack(off, w)) => {
+                if *off > 4 {
+                    out.insert((*off, *w));
+                }
+            }
+            Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs) => {
+                Self::collect_stack_param_candidates_from_expr(Some(lhs), out);
+                Self::collect_stack_param_candidates_from_expr(Some(rhs), out);
+            }
+            Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
+                Self::collect_stack_param_candidates_from_expr(Some(inner), out);
+            }
+            _ => {}
+        }
+    }
+
     /// Collect all local variables declared in the function.
-    fn collect_locals(&self, func: &Function) -> Vec<(String, BitWidth)> {
-        let mut locals: BTreeMap<String, BitWidth> = BTreeMap::new();
+    /// Returns (name, width, optional buffer size).
+    fn collect_locals(&self, func: &Function) -> Vec<(String, BitWidth, Option<u64>)> {
+        let mut locals: BTreeMap<String, (BitWidth, Option<u64>)> = BTreeMap::new();
 
         for block in &func.blocks {
             for stmt in &block.stmts {
@@ -137,15 +262,12 @@ impl<'a> CodeGenerator<'a> {
                 if let Some(var) = var {
                     match var {
                         Var::Stack(off, w) => {
-                            let name = if *off >= 0 {
-                                format!("arg_{off:x}")
-                            } else {
-                                format!("var_{:x}", off.unsigned_abs())
-                            };
-                            locals.entry(name).or_insert(*w);
+                            let name = self.stack_name(*off);
+                            let buf_size = self.buffer_sizes.get(off).copied();
+                            locals.entry(name).or_insert((*w, buf_size));
                         }
                         Var::Temp(id, w) => {
-                            locals.entry(format!("t{id}")).or_insert(*w);
+                            locals.entry(format!("t{id}")).or_insert((*w, None));
                         }
                         _ => {}
                     }
@@ -153,7 +275,7 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
-        locals.into_iter().collect()
+        locals.into_iter().map(|(name, (w, buf))| (name, w, buf)).collect()
     }
 
     // ── Loop detection ───────────────────────────────────────────
@@ -1093,21 +1215,15 @@ impl<'a> CodeGenerator<'a> {
                 // Detect folded zero-init buffer: Var::Stack(off, Bit8) = Const(total, Bit64)
                 if let (Var::Stack(off, BitWidth::Bit8), Expr::Const(total, BitWidth::Bit64)) = (var, expr) {
                     if *total >= 16 {
-                        let name = if *off >= 0 {
-                            format!("arg_{off:x}")
-                        } else {
-                            format!("var_{:x}", off.unsigned_abs())
-                        };
-                        return format!("memset(&{name}, 0, {total})");
+                        let name = self.stack_name(*off);
+                        // Arrays decay to pointers — no & needed
+                        let prefix = if self.buffer_sizes.contains_key(off) { "" } else { "&" };
+                        return format!("memset({prefix}{name}, 0, {total})");
                     }
                 }
                 // Suppress parameter assignments (var_N = param_reg)
                 if let Var::Stack(off, _) = var {
-                    let name = if *off >= 0 {
-                        format!("arg_{off:x}")
-                    } else {
-                        format!("var_{:x}", off.unsigned_abs())
-                    };
+                    let name = self.stack_name(*off);
                     if self.param_vars.contains(&name) {
                         if matches!(expr, Expr::Var(Var::Reg(_, _))) {
                             return String::new();
@@ -1201,10 +1317,8 @@ impl<'a> CodeGenerator<'a> {
                 // rbp-relative expressions → &var_N (simple) or (&var_N + dynamic)
                 if matches!(op, BinOp::Add | BinOp::Sub) {
                     if let Some((offset, dynamic)) = self.extract_rbp_base(expr) {
-                        let base = if offset < 0 {
-                            format!("&var_{:x}", (-offset) as u64)
-                        } else if offset > 0 {
-                            format!("&arg_{offset:x}")
+                        let base = if offset != 0 {
+                            format!("&{}", self.stack_name(offset))
                         } else {
                             "rbp".to_string()
                         };
@@ -1242,6 +1356,12 @@ impl<'a> CodeGenerator<'a> {
                     format!("({})(signed){}", c_type(*w), self.expr_to_c(inner))
                 }
                 UnaryOp::AddrOf => {
+                    // Arrays decay to pointers in C — emit `var_XX` not `&var_XX`
+                    if let Expr::Var(Var::Stack(off, BitWidth::Bit8)) = inner.as_ref() {
+                        if self.buffer_sizes.contains_key(off) {
+                            return self.expr_to_c(inner);
+                        }
+                    }
                     format!("&{}", self.expr_to_c(inner))
                 }
             },
@@ -1272,17 +1392,13 @@ impl<'a> CodeGenerator<'a> {
                 if let Some((offset, dynamic)) = self.extract_rbp_base(addr) {
                     if dynamic.is_none() {
                         // Simple rbp + const → direct stack variable
-                        if offset < 0 {
-                            return format!("var_{:x}", (-offset) as u64);
-                        } else if offset > 0 {
-                            return format!("arg_{offset:x}");
+                        if offset != 0 {
+                            return self.stack_name(offset);
                         }
                     } else {
                         // rbp + const + dynamic → *(type*)(&var_N + dynamic)
-                        let base = if offset < 0 {
-                            format!("&var_{:x}", (-offset) as u64)
-                        } else if offset > 0 {
-                            format!("&arg_{offset:x}")
+                        let base = if offset != 0 {
+                            format!("&{}", self.stack_name(offset))
                         } else {
                             "rbp".to_string()
                         };
@@ -1378,9 +1494,9 @@ impl<'a> CodeGenerator<'a> {
             Expr::Const(val, _) => {
                 let v = *val as i64;
                 if positive {
-                    *const_sum += v;
+                    *const_sum = const_sum.wrapping_add(v);
                 } else {
-                    *const_sum -= v;
+                    *const_sum = const_sum.wrapping_sub(v);
                 }
             }
             _ => {
@@ -1389,16 +1505,22 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    /// Look up the friendly name for a stack offset, falling back to offset-based names.
+    fn stack_name(&self, off: i64) -> String {
+        if let Some(name) = self.var_names.get(&off) {
+            return name.clone();
+        }
+        if off >= 0 {
+            format!("arg_{off:x}")
+        } else {
+            format!("var_{:x}", off.unsigned_abs())
+        }
+    }
+
     fn var_to_c(&self, var: &Var) -> String {
         match var {
             Var::Reg(reg, _) => format!("{reg}"),
-            Var::Stack(off, _) => {
-                if *off >= 0 {
-                    format!("arg_{off:x}")
-                } else {
-                    format!("var_{:x}", off.unsigned_abs())
-                }
-            }
+            Var::Stack(off, _) => self.stack_name(*off),
             Var::Temp(id, _) => {
                 let key = format!("t{id}");
                 // Inline call results: show `func(args)` instead of `t0`
