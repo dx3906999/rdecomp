@@ -23,8 +23,20 @@ pub enum DecompError {
     #[error("disassembly error: {0}")]
     DisassemblyError(String),
 
-    #[error("lift error: {0}")]
-    LiftError(String),
+    #[error("unsupported instruction at 0x{addr:x}: {mnemonic}")]
+    UnsupportedInstruction { addr: u64, mnemonic: String },
+
+    #[error("lift error at 0x{addr:x}: {detail}")]
+    LiftError { addr: u64, detail: String },
+
+    #[error("invalid CFG: {0}")]
+    InvalidCfg(String),
+
+    #[error("type conflict: {0}")]
+    TypeConflict(String),
+
+    #[error("project error: {0}")]
+    ProjectError(String),
 
     #[error("analysis error: {0}")]
     AnalysisError(String),

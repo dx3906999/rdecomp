@@ -1,20 +1,20 @@
 use clap::Parser;
 use rdecomp::analysis;
+use rdecomp::arch::{ArchDisasm, ArchLifter};
+use rdecomp::arch::x86::{X86Disasm, X86Lifter};
 use rdecomp::cfg::Cfg;
 use rdecomp::codegen::CodeGenerator;
-use rdecomp::disasm;
-use rdecomp::ir::CallingConv;
-use rdecomp::lift::Lifter;
+use rdecomp::ir::{CallingConv, Function};
 use rdecomp::loader::Binary;
 use rdecomp::project::{AnalyzedFunction, ProjectDb, hash_bytes};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "rdecomp", version, about = "High-performance x86/x64 decompiler")]
 struct Cli {
     /// Path to the binary file to decompile.
-    binary: PathBuf,
+    binary: Option<PathBuf>,
 
     /// Decompile a specific function by name.
     #[arg(short, long)]
@@ -49,6 +49,19 @@ struct Cli {
     /// unless an explicit path is given.
     #[arg(short, long)]
     project: bool,
+
+    /// Disable specific analysis passes (comma-separated).
+    /// Use --list-passes to see available pass names.
+    #[arg(long, value_delimiter = ',')]
+    disable_pass: Vec<String>,
+
+    /// Dump IR to stderr after specific passes (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    dump_after: Vec<String>,
+
+    /// List all analysis passes and exit.
+    #[arg(long)]
+    list_passes: bool,
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -60,7 +73,31 @@ fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
-    let mut binary = match Binary::from_path(&cli.binary) {
+    // Handle --list-passes early (no binary needed)
+    if cli.list_passes {
+        let pm = rdecomp::analysis::default_pass_manager();
+        println!("Available analysis passes:");
+        for (name, phase) in pm.list_passes() {
+            let phase_str = match phase {
+                rdecomp::pass::PassPhase::Early => "early",
+                rdecomp::pass::PassPhase::Iterative => "iterative",
+                rdecomp::pass::PassPhase::Repeated => "repeated",
+                rdecomp::pass::PassPhase::Late => "late",
+            };
+            println!("  {:<36} [{}]", name, phase_str);
+        }
+        return;
+    }
+
+    let binary_path = match &cli.binary {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("Error: no binary file specified. Use: rdecomp <BINARY>");
+            std::process::exit(1);
+        }
+    };
+
+    let mut binary = match Binary::from_path(&binary_path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Error loading binary: {e}");
@@ -84,7 +121,7 @@ fn main() {
     println!("Functions detected: {}", binary.functions.len());
 
     // --- Project file handling ---
-    let rdb_path = cli.binary.with_extension("rdb");
+    let rdb_path = binary_path.with_extension("rdb");
     let mut project: Option<ProjectDb> = if cli.project {
         if rdb_path.exists() {
             match ProjectDb::open(&rdb_path) {
@@ -97,7 +134,7 @@ fn main() {
                     eprintln!("Warning: could not open project file, creating new: {e}");
                     Some(ProjectDb::create(
                         &rdb_path,
-                        &cli.binary.to_string_lossy(),
+                        &binary_path.to_string_lossy(),
                         &binary,
                     ))
                 }
@@ -106,7 +143,7 @@ fn main() {
             eprintln!("Creating project: {}", rdb_path.display());
             Some(ProjectDb::create(
                 &rdb_path,
-                &cli.binary.to_string_lossy(),
+                &binary_path.to_string_lossy(),
                 &binary,
             ))
         }
@@ -167,7 +204,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut lifter = Lifter::new(binary.arch);
+    let disasm: Box<dyn ArchDisasm> = Box::new(X86Disasm);
+    let mut lifter: Box<dyn ArchLifter> = Box::new(X86Lifter::new(binary.arch));
     match (binary.arch, binary.format) {
         (rdecomp::loader::Arch::X86, _) => lifter.set_calling_conv(CallingConv::Cdecl),
         (_, rdecomp::loader::BinaryFormat::Pe) => lifter.set_calling_conv(CallingConv::Win64),
@@ -182,14 +220,13 @@ fn main() {
         .map(|(addr, _)| *addr)
         .collect();
 
-    let mut cache_hits = 0u32;
-    let mut cache_misses = 0u32;
+    // ── Interprocedural pre-pass ───────────────────────────────
+    // Lift and optimize all target functions first, then run cross-function
+    // analysis before codegen.  Functions are stored as (addr, cfg, func).
+    let mut lifted: Vec<(String, u64, Cfg, Function, Option<u64>)> = Vec::new();
+    let mut cached_outputs: HashMap<u64, String> = HashMap::new();
 
     for (name, addr, size) in &targets {
-        println!("\n{}", "=".repeat(60));
-        println!("// {} @ 0x{:x}", name, addr);
-        println!("{}", "=".repeat(60));
-
         let func_size = if *size > 0 {
             *size
         } else {
@@ -204,82 +241,117 @@ fn main() {
         };
 
         let func_size_usize = usize::try_from(func_size).unwrap_or(cli.max_size as usize);
+        let bytes_hash = binary.read_bytes(*addr, func_size_usize).map(hash_bytes);
 
-        // Compute hash of raw bytes for cache validation
-        let bytes_hash = binary.read_bytes(*addr, func_size_usize)
-            .map(|b| hash_bytes(b));
-
-        // --- Try cache hit (only for normal C output mode) ---
-        if !cli.ir && !cli.disasm && !cli.no_opt {
-            if let Some(ref proj) = project {
-                if let Some(hash) = bytes_hash {
-                    if let Some(cached) = proj.get(*addr, hash) {
-                        println!("{}", cached.c_code);
-                        cache_hits += 1;
+        // Try cache hit (only for normal C output mode)
+        if !cli.ir && !cli.disasm && !cli.no_opt
+            && let Some(ref proj) = project
+                && let Some(hash) = bytes_hash
+                    && let Some(cached) = proj.get(*addr, hash) {
+                        cached_outputs.insert(*addr, cached.c_code.clone());
                         continue;
                     }
-                }
-            }
-        }
 
-        // Step 1: Disassemble
-        let instructions = match disasm::disassemble_function(&binary, *addr, func_size) {
+        // Disassemble
+        let instructions = match disasm.disassemble_function(&binary, *addr, func_size) {
             Ok(insns) => insns,
             Err(e) => {
-                eprintln!("  Disassembly failed: {e}");
+                eprintln!("  Disassembly failed for {} @ 0x{:x}: {e}", name, addr);
                 continue;
             }
         };
-
         if instructions.is_empty() {
-            eprintln!("  No instructions found.");
             continue;
         }
 
-        log::info!("Disassembled {} instructions for {}", instructions.len(), name);
-
         if cli.disasm {
+            // Disassembly-only mode: print and skip
+            println!("\n{}", "=".repeat(60));
+            println!("// {} @ 0x{:x}", name, addr);
+            println!("{}", "=".repeat(60));
             for insn in &instructions {
                 println!("  0x{:08x}:  {}", insn.addr, insn.text);
             }
             continue;
         }
 
-        // Step 2: Build CFG
         let cfg = Cfg::build(&instructions);
-        log::info!("CFG: {} blocks", cfg.blocks.len());
+        let mut func = lifter.lift_function(name, *addr, &cfg, &binary);
 
-        // Step 3: Lift to IR
-        let mut func = lifter.lift_function(name, *addr, &cfg);
-        log::info!("Lifted {} blocks", func.blocks.len());
-
-        // Step 4: Optimize
         if !cli.no_opt {
-            analysis::optimize(&mut func, &noreturn_addrs);
+            if cli.disable_pass.is_empty() && cli.dump_after.is_empty() {
+                analysis::optimize(&mut func, &noreturn_addrs);
+            } else {
+                let mut pm = analysis::default_pass_manager();
+                for name in &cli.disable_pass {
+                    pm.disabled.insert(name.clone());
+                }
+                for name in &cli.dump_after {
+                    pm.dump_after.insert(name.clone());
+                }
+                analysis::optimize_with(&mut func, &pm, &noreturn_addrs);
+            }
         }
+
+        lifted.push((name.clone(), *addr, cfg, func, bytes_hash));
+    }
+
+    if cli.disasm {
+        // Already printed disassembly above
+        return;
+    }
+
+    // Run interprocedural analysis on all lifted functions
+    {
+        let func_refs: Vec<(u64, &Function)> = lifted.iter()
+            .map(|(_, addr, _, func, _)| (*addr, func))
+            .collect();
+        if func_refs.len() > 1 {
+            let ipa = rdecomp::interprocedural::analyze(&func_refs, &binary);
+            codegen.set_interprocedural(&ipa);
+        }
+    }
+
+    // ── Output pass ────────────────────────────────────────────
+    let mut cache_hits = 0u32;
+    let mut cache_misses = 0u32;
+
+    // Print cached outputs first, in target order
+    for (name, addr, _size) in &targets {
+        if let Some(cached_code) = cached_outputs.get(addr) {
+            println!("\n{}", "=".repeat(60));
+            println!("// {} @ 0x{:x}", name, addr);
+            println!("{}", "=".repeat(60));
+            println!("{}", cached_code);
+            cache_hits += 1;
+        }
+    }
+
+    // Print newly decompiled functions
+    for (name, addr, cfg, func, bytes_hash) in &lifted {
+        println!("\n{}", "=".repeat(60));
+        println!("// {} @ 0x{:x}", name, addr);
+        println!("{}", "=".repeat(60));
 
         if cli.ir {
             println!("{func}");
             continue;
         }
 
-        // Step 5: Generate pseudo-C
-        let code = codegen.generate(&func, &cfg);
+        let code = codegen.generate(func, cfg);
         println!("{code}");
 
-        // Step 6: Cache the result
-        if !cli.no_opt {
-            if let Some(ref mut proj) = project {
-                if let Some(hash) = bytes_hash {
+        // Cache the result
+        if !cli.no_opt
+            && let Some(ref mut proj) = project
+                && let Some(hash) = bytes_hash {
                     proj.insert(*addr, AnalyzedFunction {
-                        ir: func,
+                        ir: func.clone(),
                         c_code: code,
-                        bytes_hash: hash,
+                        bytes_hash: *hash,
                     });
                     cache_misses += 1;
                 }
-            }
-        }
     }
 
     // Save project if dirty

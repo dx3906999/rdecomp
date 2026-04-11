@@ -123,13 +123,11 @@ impl Binary {
         // Build GOT-address → symbol-name map from pltrelocs
         let mut got_to_name: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
         for rel in &elf.pltrelocs {
-            if let Some(sym) = elf.dynsyms.get(rel.r_sym) {
-                if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                    if !name.is_empty() {
+            if let Some(sym) = elf.dynsyms.get(rel.r_sym)
+                && let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+                    && !name.is_empty() {
                         got_to_name.insert(rel.r_offset, name.to_string());
                     }
-                }
-            }
         }
 
         // Scan .plt.sec (or .plt) sections for PLT stubs:
@@ -144,8 +142,8 @@ impl Binary {
                     let off = (i * stub_size) as usize;
                     let end = (off + stub_size as usize).min(sec.data.len());
                     let stub = &sec.data[off..end];
-                    if let Some(got_addr) = extract_plt_got_target(stub, stub_addr) {
-                        if let Some(name) = got_to_name.get(&got_addr) {
+                    if let Some(got_addr) = extract_plt_got_target(stub, stub_addr)
+                        && let Some(name) = got_to_name.get(&got_addr) {
                             plt_map.insert(stub_addr, name.clone());
                             if !functions.iter().any(|f| f.addr == stub_addr) {
                                 functions.push(FunctionSymbol {
@@ -155,7 +153,6 @@ impl Binary {
                                 });
                             }
                         }
-                    }
                 }
             }
         }
@@ -166,13 +163,11 @@ impl Binary {
         // Build globals map from .rela.dyn (R_X86_64_COPY, R_X86_64_GLOB_DAT for data objects)
         let mut globals_map = std::collections::HashMap::new();
         for rel in &elf.dynrelas {
-            if let Some(sym) = elf.dynsyms.get(rel.r_sym) {
-                if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                    if !name.is_empty() && sym.st_type() == goblin::elf::sym::STT_OBJECT {
+            if let Some(sym) = elf.dynsyms.get(rel.r_sym)
+                && let Some(name) = elf.dynstrtab.get_at(sym.st_name)
+                    && !name.is_empty() && sym.st_type() == goblin::elf::sym::STT_OBJECT {
                         globals_map.insert(rel.r_offset, name.to_string());
                     }
-                }
-            }
         }
 
         Ok(Binary {
@@ -218,17 +213,15 @@ impl Binary {
         // Each RuntimeFunction entry has begin_address and end_address RVAs.
         if let Some(ref exc) = pe.exception_data {
             let mut known: HashSet<u64> = HashSet::new();
-            for result in exc.functions() {
-                if let Ok(rf) = result {
-                    let addr = image_base + u64::from(rf.begin_address);
-                    let size = u64::from(rf.end_address.saturating_sub(rf.begin_address));
-                    if size > 0 && known.insert(addr) {
-                        functions.push(FunctionSymbol {
-                            name: format!("sub_{addr:x}"),
-                            addr,
-                            size,
-                        });
-                    }
+            for rf in exc.functions().flatten() {
+                let addr = image_base + u64::from(rf.begin_address);
+                let size = u64::from(rf.end_address.saturating_sub(rf.begin_address));
+                if size > 0 && known.insert(addr) {
+                    functions.push(FunctionSymbol {
+                        name: format!("sub_{addr:x}"),
+                        addr,
+                        size,
+                    });
                 }
             }
         }
@@ -297,18 +290,30 @@ impl Binary {
         }
     }
 
+    /// Read a pointer-sized value (4 or 8 bytes, little-endian) at a virtual address.
+    pub fn read_ptr(&self, addr: u64, ptr_size: usize) -> Option<u64> {
+        let bytes = self.read_bytes(addr, ptr_size)?;
+        match ptr_size {
+            4 => Some(u32::from_le_bytes(bytes[..4].try_into().ok()?) as u64),
+            8 => Some(u64::from_le_bytes(bytes[..8].try_into().ok()?)),
+            _ => None,
+        }
+    }
+
     /// Read a null-terminated C string at a virtual address (max 256 bytes).
+    /// Returns `None` if no null terminator is found within 256 bytes.
     pub fn read_cstring_at(&self, addr: u64) -> Option<String> {
         let sec = self.section_at(addr)?;
         let offset = (addr - sec.vaddr) as usize;
         let remaining = &sec.data[offset..];
-        let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len().min(256));
-        if end == 0 || end > 256 {
+        let scan_len = remaining.len().min(256);
+        let end = remaining[..scan_len].iter().position(|&b| b == 0)?;
+        if end == 0 {
             return None;
         }
         let bytes = &remaining[..end];
         // Only accept printable ASCII strings
-        if bytes.iter().all(|&b| b == b'\t' || b == b'\n' || (b >= 0x20 && b < 0x7f)) {
+        if bytes.iter().all(|&b| b == b'\t' || b == b'\n' || (0x20..0x7f).contains(&b)) {
             Some(String::from_utf8_lossy(bytes).into_owned())
         } else {
             None
@@ -374,11 +379,10 @@ impl Binary {
                         }
                         _ => None,
                     };
-                    if let Some(t) = target {
-                        if !known.contains(&t) && in_exec(t) {
+                    if let Some(t) = target
+                        && !known.contains(&t) && in_exec(t) {
                             new_addrs.insert(t);
                         }
-                    }
                 }
 
                 // 2b: immediate code references (mov reg, imm / lea reg, [rip+disp])

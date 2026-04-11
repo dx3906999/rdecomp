@@ -43,17 +43,15 @@ impl DisasmInsn {
 
     /// Get the branch/jump target address if it's a direct branch.
     pub fn branch_target(&self) -> Option<u64> {
-        if self.insn.flow_control() == iced_x86::FlowControl::ConditionalBranch
+        if (self.insn.flow_control() == iced_x86::FlowControl::ConditionalBranch
             || self.insn.flow_control() == iced_x86::FlowControl::UnconditionalBranch
-            || self.insn.flow_control() == iced_x86::FlowControl::Call
-        {
-            if self.insn.op0_kind() == iced_x86::OpKind::NearBranch16
+            || self.insn.flow_control() == iced_x86::FlowControl::Call)
+            && (self.insn.op0_kind() == iced_x86::OpKind::NearBranch16
                 || self.insn.op0_kind() == iced_x86::OpKind::NearBranch32
-                || self.insn.op0_kind() == iced_x86::OpKind::NearBranch64
+                || self.insn.op0_kind() == iced_x86::OpKind::NearBranch64)
             {
                 return Some(self.insn.near_branch_target());
             }
-        }
         None
     }
 }

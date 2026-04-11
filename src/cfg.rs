@@ -53,30 +53,26 @@ impl Cfg {
                     leaders.insert(next.addr);
                 }
                 // Branch targets are leaders
-                if let Some(target) = insn.branch_target() {
-                    if insn_addrs.contains(&target) {
+                if let Some(target) = insn.branch_target()
+                    && insn_addrs.contains(&target) {
                         leaders.insert(target);
                     }
-                }
             }
             // Call targets: the instruction after a call is also a leader for clean splits
-            if insn.is_call() {
-                if let Some(next) = instructions.get(i + 1) {
+            if insn.is_call()
+                && let Some(next) = instructions.get(i + 1) {
                     leaders.insert(next.addr);
                 }
-            }
         }
 
         // Step 2: Partition into blocks
         let leaders_vec: Vec<u64> = leaders.iter().copied().collect();
         let mut blocks = BTreeMap::new();
-        let mut block_id_counter = 0u32;
 
         // Map from leader address to block ID
         let mut addr_to_block_id: BTreeMap<u64, BlockId> = BTreeMap::new();
-        for &leader in &leaders_vec {
-            addr_to_block_id.insert(leader, BlockId(block_id_counter));
-            block_id_counter += 1;
+        for (block_id_counter, &leader) in leaders_vec.iter().enumerate() {
+            addr_to_block_id.insert(leader, BlockId(block_id_counter as u32));
         }
 
         let mut current_block_insns: Vec<DisasmInsn> = Vec::new();
@@ -136,18 +132,16 @@ impl Cfg {
                         successors.push(next_addr);
                     }
                     // Branch target
-                    if let Some(target) = last_insn.branch_target() {
-                        if blocks.contains_key(&target) {
+                    if let Some(target) = last_insn.branch_target()
+                        && blocks.contains_key(&target) {
                             successors.push(target);
                         }
-                    }
                 }
                 iced_x86::FlowControl::UnconditionalBranch => {
-                    if let Some(target) = last_insn.branch_target() {
-                        if blocks.contains_key(&target) {
+                    if let Some(target) = last_insn.branch_target()
+                        && blocks.contains_key(&target) {
                             successors.push(target);
                         }
-                    }
                 }
                 iced_x86::FlowControl::Return => {
                     // No successors

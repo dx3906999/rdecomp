@@ -119,9 +119,11 @@ impl ProjectDb {
     // Persistence
     // ------------------------------------------------------------------
 
-    /// Write the project to disk.  Call after analyses are cached.
+    /// Write the project to disk atomically (temp file + rename).
+    /// Call after analyses are cached.
     pub fn save(&mut self) -> crate::Result<()> {
-        let file = std::fs::File::create(&self.path)?;
+        let tmp_path = self.path.with_extension("rdb.tmp");
+        let file = std::fs::File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
 
         std::io::Write::write_all(&mut writer, MAGIC)?;
@@ -136,6 +138,12 @@ impl ProjectDb {
             .map_err(|e| crate::DecompError::Other(format!("serialize error: {e}")))?;
 
         std::io::Write::flush(&mut writer)?;
+        // Ensure data is written to disk before rename
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        // Atomic rename: replaces the old file only after the new one is fully written
+        std::fs::rename(&tmp_path, &self.path)?;
         self.dirty = false;
         Ok(())
     }

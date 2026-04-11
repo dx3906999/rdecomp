@@ -1,10 +1,14 @@
 use crate::cfg::Cfg;
 use crate::disasm::DisasmInsn;
 use crate::ir::*;
-use crate::loader::Arch;
+use crate::loader::{Arch, Binary};
 use iced_x86::{Mnemonic, OpKind, Register};
 use iced_x86::ConditionCode as IcedCC;
 use std::collections::BTreeMap;
+
+/// Sentinel addresses for synthetic library calls.
+pub const SYNTHETIC_MEMCPY: u64 = u64::MAX - 1;
+pub const SYNTHETIC_MEMSET: u64 = u64::MAX - 2;
 
 /// Get the memory displacement as a correctly sign-extended i64.
 /// For 32-bit address modes the displacement is only 32 bits; using
@@ -62,6 +66,10 @@ impl Lifter {
         self.calling_conv = cc;
     }
 
+    pub fn calling_conv(&self) -> CallingConv {
+        self.calling_conv
+    }
+
     /// Pointer width for the current architecture.
     fn ptr_width(&self) -> BitWidth {
         if self.calling_conv.is_32bit() { BitWidth::Bit32 } else { BitWidth::Bit64 }
@@ -80,7 +88,7 @@ impl Lifter {
 
     // ── public entry ─────────────────────────────────────────────
 
-    pub fn lift_function(&mut self, name: &str, addr: u64, cfg: &Cfg) -> Function {
+    pub fn lift_function(&mut self, name: &str, addr: u64, cfg: &Cfg, binary: &Binary) -> Function {
         let mut func = Function::new(name.to_string(), addr);
         func.entry = cfg.blocks.get(&cfg.entry).map_or(BlockId(0), |b| b.block_id);
         func.calling_conv = self.calling_conv;
@@ -116,7 +124,7 @@ impl Lifter {
             }
 
             let terminator = if let Some(last_insn) = cfg_block.instructions.last() {
-                self.lift_terminator(last_insn, &addr_to_block, cfg_block)
+                self.lift_terminator(last_insn, &addr_to_block, cfg_block, binary)
             } else {
                 Terminator::Unreachable
             };
@@ -139,11 +147,10 @@ impl Lifter {
     // ── instruction dispatch ─────────────────────────────────────
 
     fn lift_instruction(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
-        if self.in_prologue {
-            if let Some(s) = self.try_lift_prologue(insn) {
+        if self.in_prologue
+            && let Some(s) = self.try_lift_prologue(insn) {
                 return s;
             }
-        }
 
         // Suppress callee-save push/pop
         if insn.mnemonic == Mnemonic::Push && self.is_callee_save(insn) {
@@ -176,6 +183,8 @@ impl Lifter {
             Mnemonic::Shl => self.lift_arith(insn, BinOp::Shl),
             Mnemonic::Shr => self.lift_arith(insn, BinOp::Shr),
             Mnemonic::Sar => self.lift_arith(insn, BinOp::Sar),
+            Mnemonic::Rol => self.lift_arith(insn, BinOp::Rol),
+            Mnemonic::Ror => self.lift_arith(insn, BinOp::Ror),
             Mnemonic::Neg => self.lift_unary(insn, UnaryOp::Neg),
             Mnemonic::Not => self.lift_unary(insn, UnaryOp::Not),
             Mnemonic::Inc => self.lift_inc_dec(insn, BinOp::Add),
@@ -192,6 +201,33 @@ impl Lifter {
             Mnemonic::Cdq => self.lift_cdq_cqo(BitWidth::Bit32, 31),
             Mnemonic::Cqo => self.lift_cdq_cqo(BitWidth::Bit64, 63),
             Mnemonic::Xchg => self.lift_xchg(insn),
+            // REP string operations → library calls
+            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq
+                if insn.insn.has_rep_prefix() || insn.insn.has_repe_prefix() =>
+            {
+                self.lift_rep_movs()
+            }
+            Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq
+                if insn.insn.has_rep_prefix() || insn.insn.has_repe_prefix() =>
+            {
+                self.lift_rep_stos()
+            }
+            // Non-REP string ops — just skip
+            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsq
+            | Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => vec![Stmt::Nop],
+            // SSE scalar move/arithmetic (Movsd is also used for SSE scalar double)
+            Mnemonic::Movss | Mnemonic::Movsd | Mnemonic::Movaps | Mnemonic::Movups
+            | Mnemonic::Movapd | Mnemonic::Movupd => self.lift_mov(insn),
+            Mnemonic::Addss | Mnemonic::Addsd => self.lift_arith(insn, BinOp::Add),
+            Mnemonic::Subss | Mnemonic::Subsd => self.lift_arith(insn, BinOp::Sub),
+            Mnemonic::Mulss | Mnemonic::Mulsd => self.lift_arith(insn, BinOp::Mul),
+            Mnemonic::Divss | Mnemonic::Divsd => self.lift_arith(insn, BinOp::SDiv),
+            // SSE XOR (zero-init pattern: xorps xmm0, xmm0)
+            Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => self.lift_xor(insn),
+            // CVTSI2SS/SD (int → float)
+            Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => self.lift_mov(insn),
+            // CVTTSS2SI/CVTTSD2SI (float → int truncation)
+            Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si => self.lift_mov(insn),
             Mnemonic::Leave => vec![],
             Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Int3 => vec![],
             _ => vec![Stmt::Nop],
@@ -258,6 +294,7 @@ impl Lifter {
         insn: &DisasmInsn,
         addr_to_block: &BTreeMap<u64, BlockId>,
         cfg_block: &crate::cfg::CfgBlock,
+        binary: &Binary,
     ) -> Terminator {
         match insn.insn.flow_control() {
             iced_x86::FlowControl::Return => {
@@ -291,7 +328,11 @@ impl Lifter {
                 }
             }
             iced_x86::FlowControl::IndirectBranch => {
-                Terminator::IndirectJump(self.lift_operand(&insn.insn, 0))
+                if let Some(sw) = self.try_resolve_jump_table(insn, addr_to_block, binary) {
+                    sw
+                } else {
+                    Terminator::IndirectJump(self.lift_operand(&insn.insn, 0))
+                }
             }
             _ => {
                 // fall-through (call at end of block, etc.)
@@ -307,6 +348,72 @@ impl Lifter {
                 }
             }
         }
+    }
+
+    /// Try to resolve an indirect branch as a jump table (switch).
+    ///
+    /// Recognises `jmp [base + reg*scale]` where `base` is an absolute or
+    /// RIP-relative address pointing into a read-only data section.  Entries
+    /// are read until a target falls outside the set of known block addresses.
+    fn try_resolve_jump_table(
+        &self,
+        insn: &DisasmInsn,
+        addr_to_block: &BTreeMap<u64, BlockId>,
+        binary: &Binary,
+    ) -> Option<Terminator> {
+        let ix = &insn.insn;
+
+        // Must be a memory operand with an index register and scale ≥ 4
+        if ix.op0_kind() != OpKind::Memory {
+            return None;
+        }
+        let scale = ix.memory_index_scale();
+        if scale < 4 {
+            return None;
+        }
+        let index_reg = ix.memory_index();
+        if index_reg == Register::None {
+            return None;
+        }
+
+        // Compute the table base virtual address.
+        let table_base = if ix.memory_base() == Register::RIP || ix.memory_base() == Register::EIP {
+            // RIP-relative: RIP value at this point is insn.addr + insn.len
+            (insn.addr + insn.len as u64).wrapping_add(ix.memory_displacement64())
+        } else if ix.memory_base() == Register::None {
+            // Absolute address
+            ix.memory_displacement64()
+        } else {
+            // Has a base register we can't resolve statically
+            return None;
+        };
+
+        let entry_size = scale as usize; // 4 or 8
+        let max_cases: usize = 256; // safety bound
+
+        let mut cases: Vec<(u64, BlockId)> = Vec::new();
+        for i in 0..max_cases {
+            let entry_addr = table_base + (i as u64) * (entry_size as u64);
+            let target = binary.read_ptr(entry_addr, entry_size)?;
+            if let Some(&bid) = addr_to_block.get(&target) {
+                cases.push((i as u64, bid));
+            } else {
+                break;
+            }
+        }
+
+        if cases.len() < 2 {
+            return None;
+        }
+
+        let (reg_id, _) = map_register(index_reg);
+
+        let val = Expr::var(Var::Reg(
+            reg_id,
+            if entry_size == 8 { BitWidth::Bit64 } else { BitWidth::Bit32 },
+        ));
+
+        Some(Terminator::Switch(val, cases, None))
     }
 
     // ── condition fusion ─────────────────────────────────────────
@@ -604,6 +711,31 @@ impl Lifter {
         }
     }
 
+    /// REP MOVSB/MOVSW/MOVSD/MOVSQ → memcpy(rdi, rsi, rcx)
+    fn lift_rep_movs(&self) -> Vec<Stmt> {
+        let dst = Expr::var(Var::Reg(RegId::Rdi, BitWidth::Bit64));
+        let src = Expr::var(Var::Reg(RegId::Rsi, BitWidth::Bit64));
+        let cnt = Expr::var(Var::Reg(RegId::Rcx, BitWidth::Bit64));
+        // Sentinel address for synthetic "memcpy"
+        vec![Stmt::Call(
+            None,
+            Expr::Const(SYNTHETIC_MEMCPY, BitWidth::Bit64),
+            vec![dst, src, cnt],
+        )]
+    }
+
+    /// REP STOSB/STOSW/STOSD/STOSQ → memset(rdi, rax, rcx)
+    fn lift_rep_stos(&self) -> Vec<Stmt> {
+        let dst = Expr::var(Var::Reg(RegId::Rdi, BitWidth::Bit64));
+        let val = Expr::var(Var::Reg(RegId::Rax, BitWidth::Bit64));
+        let cnt = Expr::var(Var::Reg(RegId::Rcx, BitWidth::Bit64));
+        vec![Stmt::Call(
+            None,
+            Expr::Const(SYNTHETIC_MEMSET, BitWidth::Bit64),
+            vec![dst, val, cnt],
+        )]
+    }
+
     // ── operand helpers ─────────────────────────────────────────
 
     fn lift_operand(&mut self, insn: &iced_x86::Instruction, op_idx: u32) -> Expr {
@@ -799,6 +931,23 @@ fn map_register(reg: Register) -> (RegId, BitWidth) {
         Register::BH => (RegId::Rbx, BitWidth::Bit8),
         Register::CH => (RegId::Rcx, BitWidth::Bit8),
         Register::DH => (RegId::Rdx, BitWidth::Bit8),
+        // SSE registers (XMM0–XMM15) — 128-bit, but we model scalar use as 64-bit
+        Register::XMM0  => (RegId::Xmm0,  BitWidth::Bit64),
+        Register::XMM1  => (RegId::Xmm1,  BitWidth::Bit64),
+        Register::XMM2  => (RegId::Xmm2,  BitWidth::Bit64),
+        Register::XMM3  => (RegId::Xmm3,  BitWidth::Bit64),
+        Register::XMM4  => (RegId::Xmm4,  BitWidth::Bit64),
+        Register::XMM5  => (RegId::Xmm5,  BitWidth::Bit64),
+        Register::XMM6  => (RegId::Xmm6,  BitWidth::Bit64),
+        Register::XMM7  => (RegId::Xmm7,  BitWidth::Bit64),
+        Register::XMM8  => (RegId::Xmm8,  BitWidth::Bit64),
+        Register::XMM9  => (RegId::Xmm9,  BitWidth::Bit64),
+        Register::XMM10 => (RegId::Xmm10, BitWidth::Bit64),
+        Register::XMM11 => (RegId::Xmm11, BitWidth::Bit64),
+        Register::XMM12 => (RegId::Xmm12, BitWidth::Bit64),
+        Register::XMM13 => (RegId::Xmm13, BitWidth::Bit64),
+        Register::XMM14 => (RegId::Xmm14, BitWidth::Bit64),
+        Register::XMM15 => (RegId::Xmm15, BitWidth::Bit64),
         _ => (RegId::Rax, BitWidth::Bit64),
     }
 }
