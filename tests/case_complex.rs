@@ -2,6 +2,41 @@
 
 mod common;
 
+fn has_unresolved_block_gotos(output: &str) -> bool {
+    for line in output.lines() {
+        let mut rest = line;
+        while let Some(idx) = rest.find("goto bb") {
+            let suffix = &rest[idx + 5..];
+            let label_len = suffix
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .count();
+            if label_len == 0 {
+                break;
+            }
+            let label = &suffix[..label_len];
+            if !output.contains(&format!("{label}:")) {
+                return true;
+            }
+            rest = &suffix[label_len..];
+        }
+    }
+    false
+}
+
+fn has_raw_registers(output: &str) -> bool {
+    const REGS: &[&str] = &[
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+    ];
+
+    output.lines().any(|line| {
+        line.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .any(|token| REGS.contains(&token))
+    })
+}
+
 // ═══════════════════════════════════════════════════════════════
 // case7_complex: linked list, recursion, bit operations, sorting
 // ═══════════════════════════════════════════════════════════════
@@ -126,6 +161,10 @@ fn case8_find_saddle_point_nested() {
         loop_kw >= 2,
         "find_saddle_point should have >=2 loops, got {loop_kw}"
     );
+    assert!(
+        !has_raw_registers(&output),
+        "find_saddle_point should not leak raw registers, got:\n{output}"
+    );
 }
 
 #[test]
@@ -145,6 +184,10 @@ fn case9_kmp_search_decompiles() {
     let output = common::decompile_function(&binary, "kmp_search");
     let has_loop = output.contains("while") || output.contains("for");
     assert!(has_loop, "KMP should have loops");
+    assert!(
+        !output.contains("&arg_0"),
+        "kmp_search should not anchor local stack buffers at arg_0, got:\n{output}"
+    );
 }
 
 #[test]
@@ -152,6 +195,20 @@ fn case9_ht_insert_decompiles() {
     let binary = common::load_wsl_binary("case9_algorithms");
     let output = common::decompile_function(&binary, "ht_insert");
     assert!(output.contains("return"), "should have return values (1/0)");
+}
+
+#[test]
+fn case9_compute_prefix_resolves_block_gotos() {
+    let binary = common::load_wsl_binary("case9_algorithms");
+    let output = common::decompile_function(&binary, "compute_prefix");
+    assert!(
+        !has_unresolved_block_gotos(&output),
+        "compute_prefix should resolve block gotos with emitted labels, got:\n{output}"
+    );
+    assert!(
+        output.contains("while") || output.contains("for"),
+        "compute_prefix should preserve loop structure, got:\n{output}"
+    );
 }
 
 #[test]
@@ -179,6 +236,10 @@ fn case9_bfs_shortest_decompiles() {
     let output = common::decompile_function(&binary, "bfs_shortest");
     let has_loop = output.contains("while") || output.contains("for");
     assert!(has_loop, "BFS should have a loop");
+    assert!(
+        !has_raw_registers(&output),
+        "bfs_shortest should not leak raw registers, got:\n{output}"
+    );
 }
 
 #[test]
@@ -221,6 +282,10 @@ fn case10_dot_product_decompiles() {
         output.contains("return") || output.contains("*"),
         "should have computation"
     );
+    assert!(
+        !has_raw_registers(&output),
+        "dot_product should not leak raw registers, got:\n{output}"
+    );
 }
 
 #[test]
@@ -236,4 +301,32 @@ fn smoke_case10_main() {
     let binary = common::load_wsl_binary("case10_mixed");
     let output = common::decompile_function(&binary, "main");
     assert!(!output.is_empty(), "main output should not be empty");
+}
+
+#[test]
+fn stack_sample_avoids_arg0_stack_base() {
+    let binary = common::load_wsl_binary("stack");
+
+    for func_name in ["sub_4012f6", "sub_4013df"] {
+        let output = common::decompile_function(&binary, func_name);
+        assert!(
+            !output.contains("&arg_0"),
+            "{func_name} should not anchor stack locals at arg_0, got:\n{output}"
+        );
+    }
+}
+
+#[test]
+fn stack_sample_sub_4013be_has_no_phantom_local() {
+    let binary = common::load_wsl_binary("stack");
+    let output = common::decompile_function(&binary, "sub_4013be");
+
+    assert!(
+        !output.contains("uint8_t  var_1;"),
+        "sub_4013be should not declare an unused stack local, got:\n{output}"
+    );
+    assert!(
+        output.contains("return open("),
+        "sub_4013be should stay a direct open() wrapper, got:\n{output}"
+    );
 }

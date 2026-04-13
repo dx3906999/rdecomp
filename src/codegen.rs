@@ -31,10 +31,20 @@ pub struct CodeGenerator<'a> {
     dead_temps: HashSet<u32>,
     /// Register → parameter name mapping for leaf functions (e.g. Rdi → "arg_1").
     reg_params: HashMap<RegId, String>,
+    /// Fallback names for any remaining raw registers that survived analysis.
+    reg_var_names: HashMap<RegId, String>,
+    /// Stack offsets known to be parameters for the current function.
+    stack_param_offsets: HashSet<i64>,
     /// Contextual rax value from the most recently emitted parent block.
     /// Used to resolve `return rax` in relay blocks where the value comes
     /// from a predecessor that was emitted as a Stmts node.
     rax_context: Option<Expr>,
+    /// Block IDs that need labels because a fallback goto still references them.
+    label_targets: HashSet<BlockId>,
+    /// Labels already emitted for the current function.
+    emitted_labels: HashSet<BlockId>,
+    /// Active loop contexts from outermost to innermost while emitting.
+    loop_context: Vec<(BlockId, Option<BlockId>)>,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -55,7 +65,12 @@ impl<'a> CodeGenerator<'a> {
             func_summaries: HashMap::new(),
             dead_temps: HashSet::new(),
             reg_params: HashMap::new(),
+            reg_var_names: HashMap::new(),
+            stack_param_offsets: HashSet::new(),
             rax_context: None,
+            label_targets: HashSet::new(),
+            emitted_labels: HashSet::new(),
+            loop_context: Vec::new(),
         }
     }
 
@@ -64,12 +79,20 @@ impl<'a> CodeGenerator<'a> {
         self.func_summaries = info.summaries.clone();
     }
 
+    fn block_indices_by_addr(func: &Function) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..func.blocks.len()).collect();
+        indices.sort_by_key(|&idx| (func.blocks[idx].addr, idx));
+        indices
+    }
+
     /// Generate pseudo-C code for a function.
     pub fn generate(&mut self, func: &Function, cfg: &Cfg) -> String {
         let mut out = String::new();
 
         self.buffer_sizes = func.buffer_sizes.clone();
         self.var_names.clear();
+        self.stack_param_offsets.clear();
+        self.reg_var_names.clear();
         self.struct_map = struct_recovery::recover_structs(func);
 
         // ── Detect parameter offsets ─────────────────────────────
@@ -121,27 +144,26 @@ impl<'a> CodeGenerator<'a> {
             }
         }
 
+        // Find dead temp variables (defined but never read) before stack-slot
+        // collection so dead `tN = &stack_base` scaffolding doesn't create
+        // phantom locals like `var_1`.
+        self.dead_temps = Self::find_dead_temps(func);
+
         // ── Collect all stack offsets used in the function ────────
-        let mut all_offsets: BTreeMap<i64, BitWidth> = BTreeMap::new();
+        let mut all_offsets = Self::collect_stack_slots(func, &self.dead_temps);
         for (off, w) in &param_offsets {
-            all_offsets.entry(*off).or_insert(*w);
-        }
-        // Scan statements for assigned/used stack vars
-        for block in &func.blocks {
-            for stmt in &block.stmts {
-                let var = match stmt {
-                    Stmt::Assign(v, _) => Some(v),
-                    Stmt::Call(Some(v), _, _) => Some(v),
-                    _ => None,
-                };
-                if let Some(Var::Stack(off, w)) = var {
-                    all_offsets.entry(*off).or_insert(*w);
+            match all_offsets.get_mut(off) {
+                Some(existing) if *w > *existing => *existing = *w,
+                Some(_) => {}
+                None => {
+                    all_offsets.insert(*off, *w);
                 }
             }
         }
 
         // ── Build friendly name map ──────────────────────────────
         let param_off_set: HashSet<i64> = param_offsets.iter().map(|(o, _)| *o).collect();
+        self.stack_param_offsets = param_off_set.clone();
 
         // Parameters: sorted by register order (for 64-bit) or offset ascending (for 32-bit) → arg_1, arg_2, ...
         let mut param_list: Vec<(i64, BitWidth)> = param_offsets.iter().copied().collect();
@@ -168,6 +190,7 @@ impl<'a> CodeGenerator<'a> {
 
         // ── Semantic variable naming ─────────────────────────────
         self.improve_var_names(func);
+        self.assign_remaining_reg_names(func);
 
         // ── Build params and param_var_names ─────────────────────
         let mut params: Vec<(String, i64, BitWidth)> = Vec::new();
@@ -214,9 +237,6 @@ impl<'a> CodeGenerator<'a> {
         self.param_vars = param_var_names.clone();
 
         self.indent = 1;
-
-        // Find dead temp variables (defined but never read)
-        self.dead_temps = Self::find_dead_temps(func);
 
         // Build call-result map: temp vars that hold single-use call return values
         // These will be inlined as `func(args)` instead of displaying as `t0`.
@@ -269,6 +289,12 @@ impl<'a> CodeGenerator<'a> {
         Self::convert_for_loops(&mut nodes, func);
         // Post-process: collapse nested if-then into short-circuit (&&)
         Self::collapse_short_circuit(&mut nodes);
+        let emittable_ids = Self::collect_emitted_block_ids(&nodes);
+        self.label_targets = self.collect_label_targets(&nodes, func)
+            .into_iter()
+            .filter(|id| emittable_ids.contains(id))
+            .collect();
+        self.emitted_labels.clear();
         let code = self.emit_structured(&nodes, func);
         let code = Self::fold_temp_return_lines(&code);
         out.push_str(&code);
@@ -460,8 +486,8 @@ impl<'a> CodeGenerator<'a> {
             };
 
             // Check the while body for a step statement
-            let (header, condition, mut body) = if let StructuredNode::While { header, condition, body } = nodes[i + 1].clone() {
-                (header, condition, body)
+            let (header, exit, condition, mut body) = if let StructuredNode::While { header, exit, condition, body } = nodes[i + 1].clone() {
+                (header, exit, condition, body)
             } else {
                 unreachable!()
             };
@@ -482,6 +508,7 @@ impl<'a> CodeGenerator<'a> {
             nodes.remove(i); // Remove Stmts (init)
             nodes[i] = StructuredNode::For {
                 header,
+                exit,
                 init_block: init_block_id,
                 init: init_stmt,
                 condition,
@@ -628,6 +655,10 @@ impl<'a> CodeGenerator<'a> {
                 Self::collect_stack_param_candidates_from_expr(Some(lhs), out);
                 Self::collect_stack_param_candidates_from_expr(Some(rhs), out);
             }
+            Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
+                Self::collect_stack_param_candidates_from_expr(Some(lhs), out);
+                Self::collect_stack_param_candidates_from_expr(Some(rhs), out);
+            }
             Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
                 Self::collect_stack_param_candidates_from_expr(Some(inner), out);
             }
@@ -637,6 +668,109 @@ impl<'a> CodeGenerator<'a> {
                 Self::collect_stack_param_candidates_from_expr(Some(f), out);
             }
             _ => {}
+        }
+    }
+
+    fn record_stack_slot(slots: &mut BTreeMap<i64, BitWidth>, off: i64, width: BitWidth) {
+        match slots.get_mut(&off) {
+            Some(existing) if width > *existing => *existing = width,
+            Some(_) => {}
+            None => {
+                slots.insert(off, width);
+            }
+        }
+    }
+
+    fn collect_stack_slots(func: &Function, dead_temps: &HashSet<u32>) -> BTreeMap<i64, BitWidth> {
+        let mut slots = BTreeMap::new();
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                Self::collect_stack_slots_from_stmt(stmt, dead_temps, &mut slots);
+            }
+            Self::collect_stack_slots_from_term(&block.terminator, &mut slots);
+        }
+        slots
+    }
+
+    fn collect_stack_slots_from_stmt(
+        stmt: &Stmt,
+        dead_temps: &HashSet<u32>,
+        slots: &mut BTreeMap<i64, BitWidth>,
+    ) {
+        match stmt {
+            Stmt::Assign(var, expr) => {
+                if let Var::Temp(id, _) = var
+                    && dead_temps.contains(id) {
+                        return;
+                    }
+                Self::collect_stack_slots_from_var(var, slots);
+                Self::collect_stack_slots_from_expr(expr, slots);
+            }
+            Stmt::Store(addr, val, width) => {
+                if let Some((off, _)) = Self::extract_stack_addr_base(addr) {
+                    Self::record_stack_slot(slots, off, *width);
+                }
+                Self::collect_stack_slots_from_expr(addr, slots);
+                Self::collect_stack_slots_from_expr(val, slots);
+            }
+            Stmt::Call(ret, target, args) => {
+                if let Some(var) = ret {
+                    if !matches!(var, Var::Temp(id, _) if dead_temps.contains(id)) {
+                        Self::collect_stack_slots_from_var(var, slots);
+                    }
+                }
+                Self::collect_stack_slots_from_expr(target, slots);
+                for arg in args {
+                    Self::collect_stack_slots_from_expr(arg, slots);
+                }
+            }
+            Stmt::Nop => {}
+        }
+    }
+
+    fn collect_stack_slots_from_term(term: &Terminator, slots: &mut BTreeMap<i64, BitWidth>) {
+        match term {
+            Terminator::Branch(cond, _, _) => Self::collect_stack_slots_from_expr(cond, slots),
+            Terminator::Return(Some(val)) => Self::collect_stack_slots_from_expr(val, slots),
+            Terminator::IndirectJump(target) => Self::collect_stack_slots_from_expr(target, slots),
+            Terminator::Switch(val, _, _) => Self::collect_stack_slots_from_expr(val, slots),
+            _ => {}
+        }
+    }
+
+    fn collect_stack_slots_from_var(var: &Var, slots: &mut BTreeMap<i64, BitWidth>) {
+        if let Var::Stack(off, width) = var {
+            Self::record_stack_slot(slots, *off, *width);
+        }
+    }
+
+    fn collect_stack_slots_from_expr(expr: &Expr, slots: &mut BTreeMap<i64, BitWidth>) {
+        if let Some((off, _)) = Self::extract_stack_addr_base(expr) {
+            Self::record_stack_slot(slots, off, BitWidth::Bit8);
+        }
+
+        match expr {
+            Expr::Var(var) => Self::collect_stack_slots_from_var(var, slots),
+            Expr::Load(addr, width) => {
+                if let Some((off, _)) = Self::extract_stack_addr_base(addr) {
+                    Self::record_stack_slot(slots, off, *width);
+                }
+                Self::collect_stack_slots_from_expr(addr, slots);
+            }
+            Expr::BinOp(_, lhs, rhs)
+            | Expr::Cmp(_, lhs, rhs)
+            | Expr::LogicalAnd(lhs, rhs)
+            | Expr::LogicalOr(lhs, rhs) => {
+                Self::collect_stack_slots_from_expr(lhs, slots);
+                Self::collect_stack_slots_from_expr(rhs, slots);
+            }
+            Expr::UnaryOp(_, inner) => Self::collect_stack_slots_from_expr(inner, slots),
+            Expr::Select(cond, then_expr, else_expr) => {
+                Self::collect_stack_slots_from_expr(cond, slots);
+                Self::collect_stack_slots_from_expr(then_expr, slots);
+                Self::collect_stack_slots_from_expr(else_expr, slots);
+            }
+            Expr::Const(..) | Expr::Cond(_) => {}
         }
     }
 
@@ -743,6 +877,24 @@ impl<'a> CodeGenerator<'a> {
     fn collect_locals(&self, func: &Function) -> Vec<(String, String, BitWidth, Option<u64>)> {
         let mut locals: BTreeMap<String, (String, BitWidth, Option<u64>)> = BTreeMap::new();
 
+        for (off, width) in Self::collect_stack_slots(func, &self.dead_temps) {
+            let name = self.stack_name(off);
+            let type_key = stack_type_key(off);
+            let buf_size = self.buffer_sizes.get(&off).copied();
+            locals.entry(name).or_insert((type_key, width, buf_size));
+        }
+
+        for (reg, name) in &self.reg_var_names {
+            let type_key = format!("{reg}");
+            let width = match reg {
+                RegId::Xmm0 | RegId::Xmm1 | RegId::Xmm2 | RegId::Xmm3 | RegId::Xmm4 | RegId::Xmm5
+                | RegId::Xmm6 | RegId::Xmm7 | RegId::Xmm8 | RegId::Xmm9 | RegId::Xmm10 | RegId::Xmm11
+                | RegId::Xmm12 | RegId::Xmm13 | RegId::Xmm14 | RegId::Xmm15 => BitWidth::Bit64,
+                _ => BitWidth::Bit64,
+            };
+            locals.entry(name.clone()).or_insert((type_key, width, None));
+        }
+
         for block in &func.blocks {
             for stmt in &block.stmts {
                 let var = match stmt {
@@ -752,12 +904,6 @@ impl<'a> CodeGenerator<'a> {
                 };
                 if let Some(var) = var {
                     match var {
-                        Var::Stack(off, w) => {
-                            let name = self.stack_name(*off);
-                            let type_key = stack_type_key(*off);
-                            let buf_size = self.buffer_sizes.get(off).copied();
-                            locals.entry(name).or_insert((type_key, *w, buf_size));
-                        }
                         Var::Temp(id, w) => {
                             let key = format!("t{id}");
                             if !self.dead_temps.contains(id)
@@ -773,6 +919,140 @@ impl<'a> CodeGenerator<'a> {
         }
 
         locals.into_iter().map(|(name, (tk, w, buf))| (name, tk, w, buf)).collect()
+    }
+
+    fn assign_remaining_reg_names(&mut self, func: &Function) {
+        let param_regs = func.calling_conv.param_regs();
+        let mut seen: HashSet<RegId> = HashSet::new();
+        let mut used_names: HashSet<String> = self.var_names.values().cloned().collect();
+        used_names.extend(self.reg_params.values().cloned());
+
+        let mut next_arg_idx = self.reg_params.values()
+            .filter_map(|name| name.strip_prefix("arg_").and_then(|n| n.parse::<usize>().ok()))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut next_var_idx = used_names.iter()
+            .filter_map(|name| name.strip_prefix("var_").and_then(|n| n.parse::<usize>().ok()))
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        for reg in self.collect_remaining_regs(func) {
+            if !seen.insert(reg) {
+                continue;
+            }
+
+            if self.reg_params.contains_key(&reg) || self.reg_var_names.contains_key(&reg) {
+                continue;
+            }
+
+            if param_regs.contains(&reg) && !self.reg_is_defined(func, reg) {
+                let name = format!("arg_{next_arg_idx}");
+                next_arg_idx += 1;
+                used_names.insert(name.clone());
+                self.reg_params.insert(reg, name);
+                continue;
+            }
+
+            loop {
+                let name = format!("var_{next_var_idx}");
+                next_var_idx += 1;
+                if used_names.insert(name.clone()) {
+                    self.reg_var_names.insert(reg, name);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn collect_remaining_regs(&self, func: &Function) -> Vec<RegId> {
+        let mut regs = Vec::new();
+        let mut seen = HashSet::new();
+
+        for block_idx in Self::block_indices_by_addr(func) {
+            let block = &func.blocks[block_idx];
+            for stmt in &block.stmts {
+                Self::collect_regs_from_stmt(stmt, &mut regs, &mut seen);
+            }
+            Self::collect_regs_from_terminator(&block.terminator, &mut regs, &mut seen);
+        }
+
+        regs.into_iter()
+            .filter(|reg| !matches!(reg, RegId::Rsp | RegId::Rbp | RegId::Rip))
+            .collect()
+    }
+
+    fn collect_regs_from_stmt(stmt: &Stmt, out: &mut Vec<RegId>, seen: &mut HashSet<RegId>) {
+        match stmt {
+            Stmt::Assign(var, expr) => {
+                Self::collect_regs_from_var(var, out, seen);
+                Self::collect_regs_from_expr(expr, out, seen);
+            }
+            Stmt::Store(addr, val, _) => {
+                Self::collect_regs_from_expr(addr, out, seen);
+                Self::collect_regs_from_expr(val, out, seen);
+            }
+            Stmt::Call(ret, target, args) => {
+                if let Some(var) = ret {
+                    Self::collect_regs_from_var(var, out, seen);
+                }
+                Self::collect_regs_from_expr(target, out, seen);
+                for arg in args {
+                    Self::collect_regs_from_expr(arg, out, seen);
+                }
+            }
+            Stmt::Nop => {}
+        }
+    }
+
+    fn collect_regs_from_terminator(term: &Terminator, out: &mut Vec<RegId>, seen: &mut HashSet<RegId>) {
+        match term {
+            Terminator::Branch(cond, _, _) => Self::collect_regs_from_expr(cond, out, seen),
+            Terminator::Return(Some(val)) => Self::collect_regs_from_expr(val, out, seen),
+            Terminator::IndirectJump(target) => Self::collect_regs_from_expr(target, out, seen),
+            Terminator::Switch(val, _, _) => Self::collect_regs_from_expr(val, out, seen),
+            _ => {}
+        }
+    }
+
+    fn collect_regs_from_var(var: &Var, out: &mut Vec<RegId>, seen: &mut HashSet<RegId>) {
+        if let Var::Reg(reg, _) = var
+            && seen.insert(*reg) {
+                out.push(*reg);
+            }
+    }
+
+    fn collect_regs_from_expr(expr: &Expr, out: &mut Vec<RegId>, seen: &mut HashSet<RegId>) {
+        match expr {
+            Expr::Var(var) => Self::collect_regs_from_var(var, out, seen),
+            Expr::BinOp(_, lhs, rhs)
+            | Expr::Cmp(_, lhs, rhs)
+            | Expr::LogicalAnd(lhs, rhs)
+            | Expr::LogicalOr(lhs, rhs) => {
+                Self::collect_regs_from_expr(lhs, out, seen);
+                Self::collect_regs_from_expr(rhs, out, seen);
+            }
+            Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
+                Self::collect_regs_from_expr(inner, out, seen);
+            }
+            Expr::Select(cond, then_expr, else_expr) => {
+                Self::collect_regs_from_expr(cond, out, seen);
+                Self::collect_regs_from_expr(then_expr, out, seen);
+                Self::collect_regs_from_expr(else_expr, out, seen);
+            }
+            Expr::Const(..) | Expr::Cond(_) => {}
+        }
+    }
+
+    fn reg_is_defined(&self, func: &Function, reg: RegId) -> bool {
+        func.blocks.iter().any(|block| {
+            block.stmts.iter().any(|stmt| match stmt {
+                Stmt::Assign(Var::Reg(r, _), _) if *r == reg => true,
+                Stmt::Call(Some(Var::Reg(r, _)), _, _) if *r == reg => true,
+                _ => false,
+            })
+        })
     }
 
     /// Find temp variable IDs that are never referenced in any expression or
@@ -913,7 +1193,8 @@ impl<'a> CodeGenerator<'a> {
         // Walk blocks in order; for the entry block we track read-before-write
         // precisely.  For other blocks we just check if param regs appear as
         // reads without being written first in the function body.
-        for block in &func.blocks {
+        for block_idx in Self::block_indices_by_addr(func) {
+            let block = &func.blocks[block_idx];
             for stmt in &block.stmts {
                 // Collect reads from the RHS / args first (before recording write)
                 match stmt {
@@ -1212,8 +1493,16 @@ impl<'a> CodeGenerator<'a> {
                             } else {
                                 negate_condition(cond)
                             };
+                            let exit = if t_in_loop && !f_in_loop {
+                                Some(*f)
+                            } else if !t_in_loop && f_in_loop {
+                                Some(*t)
+                            } else {
+                                None
+                            };
                             StructuredNode::DoWhile {
                                 header: bid,
+                                exit,
                                 condition: do_cond,
                                 body: vec![],
                             }
@@ -1257,6 +1546,7 @@ impl<'a> CodeGenerator<'a> {
                                 while_exit_guard = Some(negate_condition(cond));
                                 StructuredNode::While {
                                     header: bid,
+                                    exit: Some(header_exit),
                                     condition: Expr::LogicalAnd(
                                         Box::new(cond.clone()),
                                         Box::new(latch_cond),
@@ -1271,6 +1561,7 @@ impl<'a> CodeGenerator<'a> {
                                 while_exit_guard = Some(negate_condition(cond));
                                 StructuredNode::While {
                                     header: bid,
+                                    exit: Some(header_exit),
                                     condition: cond.clone(),
                                     body: nodes,
                                 }
@@ -1312,6 +1603,7 @@ impl<'a> CodeGenerator<'a> {
                                 while_exit_guard = Some(cond.clone());
                                 StructuredNode::While {
                                     header: bid,
+                                    exit: Some(header_exit),
                                     condition: Expr::LogicalAnd(
                                         Box::new(negate_condition(cond)),
                                         Box::new(latch_cond),
@@ -1326,6 +1618,7 @@ impl<'a> CodeGenerator<'a> {
                                 while_exit_guard = Some(cond.clone());
                                 StructuredNode::While {
                                     header: bid,
+                                    exit: Some(header_exit),
                                     condition: negate_condition(cond),
                                     body: nodes,
                                 }
@@ -1339,7 +1632,7 @@ impl<'a> CodeGenerator<'a> {
                             // with cond2 → while (cond1 || cond2)
                             // Pattern: header: if(cond) goto header else latch;
                             //          latch:  if(lcond) goto header else exit;
-                            let or_fold: Option<(Expr, BlockId, BlockId)> = if (*t == bid || *f == bid) {
+                            let or_fold: Option<(Expr, BlockId, BlockId)> = if *t == bid || *f == bid {
                                 let (self_cond, other) = if *t == bid {
                                     (cond.clone(), *f)
                                 } else {
@@ -1395,6 +1688,7 @@ impl<'a> CodeGenerator<'a> {
                                 body_nodes.push(StructuredNode::Stmts(latch_id));
                                 StructuredNode::While {
                                     header: bid,
+                                    exit: Some(_exit_bid),
                                     condition: or_cond,
                                     body: body_nodes,
                                 }
@@ -1436,27 +1730,46 @@ impl<'a> CodeGenerator<'a> {
                                 let inner_nodes = self.structure_region(
                                     func, cfg, &inner_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
                                 );
-                                // Build body: header's conditional branch as if-then,
-                                // then latch stmts.
-                                let mut body_nodes = Vec::new();
-                                if !inner_nodes.is_empty() {
-                                    if inner_ids.first() == Some(t) {
-                                        body_nodes.push(StructuredNode::IfThen {
-                                            condition: cond.clone(),
-                                            then_body: inner_nodes,
-                                        });
-                                    } else if inner_ids.first() == Some(f) {
-                                        body_nodes.push(StructuredNode::IfThen {
-                                            condition: negate_condition(cond),
-                                            then_body: inner_nodes,
-                                        });
-                                    } else {
-                                        body_nodes.extend(inner_nodes);
+                                // Build body: try to split header branches into
+                                // prefix path + common tail before falling back to
+                                // the older linear wrapping heuristic.
+                                let body_nodes = if let Some(nodes) = self.structure_loop_internal_branch(
+                                    func,
+                                    cfg,
+                                    bid,
+                                    cond,
+                                    *t,
+                                    *f,
+                                    latch_id,
+                                    &inner_ids,
+                                    loop_headers,
+                                    loop_bodies,
+                                    back_edge_sources,
+                                ) {
+                                    nodes
+                                } else {
+                                    let mut nodes = Vec::new();
+                                    if !inner_nodes.is_empty() {
+                                        if inner_ids.first() == Some(t) {
+                                            nodes.push(StructuredNode::IfThen {
+                                                condition: cond.clone(),
+                                                then_body: inner_nodes,
+                                            });
+                                        } else if inner_ids.first() == Some(f) {
+                                            nodes.push(StructuredNode::IfThen {
+                                                condition: negate_condition(cond),
+                                                then_body: inner_nodes,
+                                            });
+                                        } else {
+                                            nodes.extend(inner_nodes);
+                                        }
                                     }
-                                }
-                                body_nodes.push(StructuredNode::Stmts(latch_id));
+                                    nodes.push(StructuredNode::Stmts(latch_id));
+                                    nodes
+                                };
                                 StructuredNode::DoWhile {
                                     header: bid,
+                                    exit: None,
                                     condition: do_cond,
                                     body: body_nodes,
                                 }
@@ -1466,6 +1779,7 @@ impl<'a> CodeGenerator<'a> {
                                 );
                                 StructuredNode::While {
                                     header: bid,
+                                    exit: None,
                                     condition: Expr::const_val(1, BitWidth::Bit32),
                                     body: nodes,
                                 }
@@ -1518,6 +1832,7 @@ impl<'a> CodeGenerator<'a> {
                             body_nodes.push(StructuredNode::Stmts(latch_id));
                             StructuredNode::DoWhile {
                                 header: bid,
+                                exit: None,
                                 condition: cond,
                                 body: body_nodes,
                             }
@@ -1527,6 +1842,7 @@ impl<'a> CodeGenerator<'a> {
                             );
                             StructuredNode::While {
                                 header: bid,
+                                exit: None,
                                 condition: Expr::const_val(1, BitWidth::Bit32),
                                 body: body_nodes,
                             }
@@ -2298,6 +2614,118 @@ impl<'a> CodeGenerator<'a> {
         visited
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn structure_loop_internal_branch(
+        &self,
+        func: &Function,
+        cfg: &Cfg,
+        header: BlockId,
+        cond: &Expr,
+        t: BlockId,
+        f: BlockId,
+        latch_id: BlockId,
+        inner_ids: &[BlockId],
+        loop_headers: &BTreeSet<BlockId>,
+        loop_bodies: &HashMap<BlockId, BTreeSet<BlockId>>,
+        back_edge_sources: &HashMap<BlockId, Vec<BlockId>>,
+    ) -> Option<Vec<StructuredNode>> {
+        let region: HashSet<BlockId> = inner_ids.iter().copied().collect();
+
+        if region.is_empty() {
+            return Some(vec![StructuredNode::Stmts(latch_id)]);
+        }
+
+        if t == latch_id || f == latch_id {
+            let prefix_start = if t == latch_id { f } else { t };
+            if region.contains(&prefix_start) {
+                let prefix_cond = if t == latch_id {
+                    negate_condition(cond)
+                } else {
+                    cond.clone()
+                };
+                let prefix_body = self.structure_region(
+                    func,
+                    cfg,
+                    inner_ids,
+                    loop_headers,
+                    loop_bodies,
+                    back_edge_sources,
+                    Some(header),
+                );
+                let mut body_nodes = Vec::new();
+                if !prefix_body.is_empty() {
+                    body_nodes.push(StructuredNode::IfThen {
+                        condition: prefix_cond,
+                        then_body: prefix_body,
+                    });
+                }
+                body_nodes.push(StructuredNode::Stmts(latch_id));
+                return Some(body_nodes);
+            }
+        }
+
+        if !region.contains(&t) || !region.contains(&f) {
+            return None;
+        }
+
+        let t_reaches_f = self.reachable_from(func, t, &region).contains(&f);
+        let f_reaches_t = self.reachable_from(func, f, &region).contains(&t);
+        let (prefix_start, common_start, prefix_cond) = if f_reaches_t && !t_reaches_f {
+            (f, t, negate_condition(cond))
+        } else if t_reaches_f && !f_reaches_t {
+            (t, f, cond.clone())
+        } else {
+            return None;
+        };
+
+        let prefix_blocks = self.collect_arm_blocks(
+            func,
+            prefix_start,
+            Some(common_start),
+            &region,
+            Some(header),
+        );
+        let prefix_set: HashSet<BlockId> = prefix_blocks.iter().copied().collect();
+        let common_blocks: Vec<BlockId> = inner_ids
+            .iter()
+            .copied()
+            .filter(|bid| !prefix_set.contains(bid))
+            .collect();
+
+        let mut body_nodes = Vec::new();
+        if !prefix_blocks.is_empty() {
+            let then_body = self.structure_region(
+                func,
+                cfg,
+                &prefix_blocks,
+                loop_headers,
+                loop_bodies,
+                back_edge_sources,
+                Some(header),
+            );
+            if !then_body.is_empty() {
+                body_nodes.push(StructuredNode::IfThen {
+                    condition: prefix_cond,
+                    then_body,
+                });
+            }
+        }
+
+        if !common_blocks.is_empty() {
+            body_nodes.extend(self.structure_region(
+                func,
+                cfg,
+                &common_blocks,
+                loop_headers,
+                loop_bodies,
+                back_edge_sources,
+                Some(header),
+            ));
+        }
+        body_nodes.push(StructuredNode::Stmts(latch_id));
+        Some(body_nodes)
+    }
+
     /// Structure a single arm for inline emission (e.g., loop-back-edge branches).
     #[allow(clippy::too_many_arguments)]
     fn structure_arm_inline(
@@ -2383,6 +2811,96 @@ impl<'a> CodeGenerator<'a> {
         chain
     }
 
+    fn collect_emitted_block_ids(nodes: &[StructuredNode]) -> HashSet<BlockId> {
+        let mut ids = HashSet::new();
+        for node in nodes {
+            match node {
+                StructuredNode::Block(id) | StructuredNode::Stmts(id) => {
+                    ids.insert(*id);
+                }
+                StructuredNode::IfThen { then_body, .. } => {
+                    ids.extend(Self::collect_emitted_block_ids(then_body));
+                }
+                StructuredNode::IfThenElse { then_body, else_body, .. } => {
+                    ids.extend(Self::collect_emitted_block_ids(then_body));
+                    ids.extend(Self::collect_emitted_block_ids(else_body));
+                }
+                StructuredNode::While { header, body, .. }
+                | StructuredNode::DoWhile { header, body, .. } => {
+                    ids.insert(*header);
+                    ids.extend(Self::collect_emitted_block_ids(body));
+                }
+                StructuredNode::For { header, init_block, body, .. } => {
+                    ids.insert(*header);
+                    ids.insert(*init_block);
+                    ids.extend(Self::collect_emitted_block_ids(body));
+                }
+                StructuredNode::Break => {}
+            }
+        }
+        ids
+    }
+
+    fn collect_label_targets(&self, nodes: &[StructuredNode], func: &Function) -> HashSet<BlockId> {
+        let mut targets = HashSet::new();
+
+        for node in nodes {
+            match node {
+                StructuredNode::Block(id) => {
+                    let Some(block) = func.block(*id) else {
+                        continue;
+                    };
+                    match &block.terminator {
+                        Terminator::Jump(target) => {
+                            let tail = self.collect_goto_tail(func, *target);
+                            let ends_with_return = tail.last().and_then(|&bid| func.block(bid))
+                                .is_some_and(|tb| matches!(tb.terminator, Terminator::Return(_)));
+                            if !ends_with_return {
+                                targets.insert(*target);
+                            }
+                        }
+                        Terminator::Branch(_, t, f) => {
+                            targets.insert(*t);
+                            targets.insert(*f);
+                        }
+                        Terminator::Switch(_, cases, default) => {
+                            for (_, bid) in cases {
+                                targets.insert(*bid);
+                            }
+                            if let Some(bid) = default {
+                                targets.insert(*bid);
+                            }
+                        }
+                        Terminator::IndirectJump(_)
+                        | Terminator::Return(_)
+                        | Terminator::Unreachable => {}
+                    }
+                }
+                StructuredNode::IfThen { then_body, .. } => {
+                    targets.extend(self.collect_label_targets(then_body, func));
+                }
+                StructuredNode::IfThenElse { then_body, else_body, .. } => {
+                    targets.extend(self.collect_label_targets(then_body, func));
+                    targets.extend(self.collect_label_targets(else_body, func));
+                }
+                StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::For { body, .. } => {
+                    targets.extend(self.collect_label_targets(body, func));
+                }
+                StructuredNode::Stmts(_) | StructuredNode::Break => {}
+            }
+        }
+
+        targets
+    }
+
+    fn emit_label_if_needed(&mut self, out: &mut String, id: BlockId) {
+        if self.label_targets.contains(&id) && self.emitted_labels.insert(id) {
+            let _ = writeln!(out, "{}{}:", self.indent_str(), id);
+        }
+    }
+
     /// Advance index past blocks that were consumed by an arm.
     fn advance_past_arm(&self, block_ids: &[BlockId], start_idx: usize, arm_nodes: &[StructuredNode]) -> usize {
         let arm_ids: HashSet<BlockId> = arm_nodes
@@ -2411,6 +2929,7 @@ impl<'a> CodeGenerator<'a> {
         for node in nodes {
             match node {
                 StructuredNode::Block(id) => {
+                    self.emit_label_if_needed(&mut out, *id);
                     if let Some(block) = func.block(*id) {
                         out.push_str(&self.emit_block_full(block, func));
                         if self.block_has_noreturn(block) {
@@ -2431,6 +2950,7 @@ impl<'a> CodeGenerator<'a> {
                     }
                 }
                 StructuredNode::Stmts(id) => {
+                    self.emit_label_if_needed(&mut out, *id);
                     if let Some(block) = func.block(*id) {
                         // Track rax assignment for relay block resolution
                         if let Some(expr) = self.last_rax_assignment_expr(block) {
@@ -2494,7 +3014,8 @@ impl<'a> CodeGenerator<'a> {
                     self.indent -= 1;
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
-                StructuredNode::While { header, condition, body, .. } => {
+                StructuredNode::While { header, exit, condition, body, .. } => {
+                    self.emit_label_if_needed(&mut out, *header);
                     let header_has_stmts = func.block(*header)
                         .is_some_and(|b| b.stmts.iter().any(|s| !matches!(s, Stmt::Nop)));
                     if body.is_empty() && !header_has_stmts {
@@ -2509,7 +3030,9 @@ impl<'a> CodeGenerator<'a> {
                     let cond_str = self.expr_to_c(condition);
                     let _ = writeln!(out, "{}while ({}) {{", self.indent_str(), cond_str);
                     self.indent += 1;
+                    self.loop_context.push((*header, *exit));
                     out.push_str(&self.emit_structured(body, func));
+                    self.loop_context.pop();
                     // Re-emit header statements at end of loop body so that
                     // condition-setup code runs before the next check.
                     if let Some(block) = func.block(*header) {
@@ -2520,7 +3043,8 @@ impl<'a> CodeGenerator<'a> {
                     self.indent -= 1;
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
-                StructuredNode::DoWhile { header, condition, body, .. } => {
+                StructuredNode::DoWhile { header, exit, condition, body, .. } => {
+                    self.emit_label_if_needed(&mut out, *header);
                     let header_has_stmts = func.block(*header)
                         .is_some_and(|b| b.stmts.iter().any(|s| !matches!(s, Stmt::Nop)));
                     if body.is_empty() && !header_has_stmts {
@@ -2528,20 +3052,24 @@ impl<'a> CodeGenerator<'a> {
                     }
                     let _ = writeln!(out, "{}do {{", self.indent_str());
                     self.indent += 1;
+                    self.loop_context.push((*header, *exit));
                     // Emit header statements as part of the loop body
                     if let Some(block) = func.block(*header) {
                         self.emit_stmts_only(&mut out, block);
                     }
                     out.push_str(&self.emit_structured(body, func));
+                    self.loop_context.pop();
                     self.indent -= 1;
                     let cond_str = self.expr_to_c(condition);
                     let _ = writeln!(out, "{}}} while ({});", self.indent_str(), cond_str);
                 }
-                StructuredNode::For { header, init_block, init, condition, step, body, .. } => {
+                StructuredNode::For { header, exit, init_block, init, condition, step, body, .. } => {
+                    self.emit_label_if_needed(&mut out, *init_block);
                     // Emit other stmts from the init block (e.g. sum = 0) excluding the for-init
                     if let Some(block) = func.block(*init_block) {
                         self.emit_stmts_skip(block, init, &mut out);
                     }
+                    self.emit_label_if_needed(&mut out, *header);
                     // Emit header stmts (usually empty)
                     if let Some(block) = func.block(*header) {
                         self.emit_stmts_only(&mut out, block);
@@ -2551,16 +3079,15 @@ impl<'a> CodeGenerator<'a> {
                     let step_str = self.stmt_to_c(step);
                     let _ = writeln!(out, "{}for ({}; {}; {}) {{", self.indent_str(), init_str, cond_str, step_str);
                     self.indent += 1;
+                    self.loop_context.push((*header, *exit));
                     // Emit body, skipping the step stmt from the last block
                     out.push_str(&self.emit_structured_for_body(body, func, step));
+                    self.loop_context.pop();
                     self.indent -= 1;
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
                 StructuredNode::Break => {
                     let _ = writeln!(out, "{}break;", self.indent_str());
-                }
-                StructuredNode::Continue => {
-                    let _ = writeln!(out, "{}continue;", self.indent_str());
                 }
             }
         }
@@ -2656,6 +3183,29 @@ impl<'a> CodeGenerator<'a> {
                 };
             }
             Terminator::Jump(target) => {
+                if let Some((loop_header, loop_exit)) = self.loop_context.last().copied() {
+                    if *target == loop_header {
+                        let _ = writeln!(out, "{}continue;", self.indent_str());
+                        return out;
+                    }
+                    if loop_exit == Some(*target) {
+                        let exit_node = self.loop_exit_node(func, *target);
+                        match exit_node {
+                            StructuredNode::Break => {
+                                let _ = writeln!(out, "{}break;", self.indent_str());
+                            }
+                            StructuredNode::Block(exit_bid) => {
+                                if let Some(exit_block) = func.block(exit_bid) {
+                                    out.push_str(&self.emit_block_full(exit_block, func));
+                                }
+                            }
+                            _ => {
+                                let _ = writeln!(out, "{}break;", self.indent_str());
+                            }
+                        }
+                        return out;
+                    }
+                }
                 // Try to inline the goto tail chain
                 let tail = self.collect_goto_tail(func, *target);
                 if !tail.is_empty() {
@@ -2804,7 +3354,8 @@ impl<'a> CodeGenerator<'a> {
                 // Suppress register assignments UNLESS the register is a
                 // detected parameter — those get rendered as arg_N updates.
                 if let Var::Reg(r, _) = var {
-                    if !self.reg_params.contains_key(r) {
+                    if !self.reg_params.contains_key(r)
+                        && !self.reg_var_names.contains_key(r) {
                         return String::new();
                     }
                 }
@@ -2842,6 +3393,9 @@ impl<'a> CodeGenerator<'a> {
                 // Struct field store: ptr->field_N = val
                 if let Some(access) = self.try_struct_field(addr) {
                     return format!("{} = {}", access, self.expr_to_c(val));
+                }
+                if let Some((offset, None)) = Self::extract_stack_addr_base(addr) {
+                    return format!("{} = {}", self.stack_name(offset), self.expr_to_c(val));
                 }
                 format!(
                     "*({}*)({}) = {}",
@@ -2961,11 +3515,19 @@ impl<'a> CodeGenerator<'a> {
                     && let Expr::Var(Var::Reg(RegId::Rip, _)) = lhs.as_ref() {
                         return self.expr_to_c(rhs);
                     }
+                if matches!(op, BinOp::Add | BinOp::Sub)
+                    && let Some((offset, dynamic)) = Self::extract_stack_addr_base(expr) {
+                        let base = self.stack_addr_base_to_c(offset, dynamic.is_some());
+                        return match dynamic {
+                            Some(dyn_expr) => format!("({} + {})", base, self.expr_to_c(&dyn_expr)),
+                            None => base,
+                        };
+                    }
                 // rbp-relative expressions → &var_N (simple) or (&var_N + dynamic)
                 if matches!(op, BinOp::Add | BinOp::Sub)
                     && let Some((offset, dynamic)) = self.extract_rbp_base(expr) {
                         let base = if offset != 0 {
-                            format!("&{}", self.stack_name(offset))
+                            self.stack_addr_base_to_c(offset, dynamic.is_some())
                         } else {
                             "rbp".to_string()
                         };
@@ -3035,6 +3597,13 @@ impl<'a> CodeGenerator<'a> {
                 // Struct field access: ptr->field_N
                 if let Some(access) = self.try_struct_field(addr) {
                     return access;
+                }
+                if let Some((offset, dynamic)) = Self::extract_stack_addr_base(addr) {
+                    if let Some(dyn_expr) = dynamic {
+                        let base = self.stack_addr_base_to_c(offset, true);
+                        return format!("*({}*)({} + {})", c_type(*width), base, self.expr_to_c(&dyn_expr));
+                    }
+                    return self.stack_name(offset);
                 }
                 // Stack loads: *(type*)(rbp + offset) → var_N / arg_N
                 if let Some((offset, dynamic)) = self.extract_rbp_base(addr) {
@@ -3308,12 +3877,117 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
+    fn extract_stack_addr_base(expr: &Expr) -> Option<(i64, Option<Expr>)> {
+        let mut base_offset: Option<i64> = None;
+        let mut const_sum = 0i64;
+        let mut dynamic_parts: Vec<Expr> = Vec::new();
+        let mut valid = true;
+
+        Self::flatten_stack_addr_base(
+            expr,
+            true,
+            &mut base_offset,
+            &mut const_sum,
+            &mut dynamic_parts,
+            &mut valid,
+        );
+
+        if !valid {
+            return None;
+        }
+
+        let offset = base_offset?.wrapping_add(const_sum);
+        let dynamic = if dynamic_parts.is_empty() {
+            None
+        } else {
+            let mut iter = dynamic_parts.into_iter();
+            let mut acc = iter.next().unwrap();
+            for part in iter {
+                acc = Expr::binop(BinOp::Add, acc, part);
+            }
+            Some(acc)
+        };
+
+        Some((offset, dynamic))
+    }
+
+    fn flatten_stack_addr_base(
+        expr: &Expr,
+        positive: bool,
+        base_offset: &mut Option<i64>,
+        const_sum: &mut i64,
+        dynamic_parts: &mut Vec<Expr>,
+        valid: &mut bool,
+    ) {
+        if !*valid {
+            return;
+        }
+
+        match expr {
+            Expr::BinOp(BinOp::Add, lhs, rhs) => {
+                Self::flatten_stack_addr_base(lhs, positive, base_offset, const_sum, dynamic_parts, valid);
+                Self::flatten_stack_addr_base(rhs, positive, base_offset, const_sum, dynamic_parts, valid);
+            }
+            Expr::BinOp(BinOp::Sub, lhs, rhs) => {
+                Self::flatten_stack_addr_base(lhs, positive, base_offset, const_sum, dynamic_parts, valid);
+                Self::flatten_stack_addr_base(rhs, !positive, base_offset, const_sum, dynamic_parts, valid);
+            }
+            Expr::UnaryOp(UnaryOp::AddrOf, inner) => {
+                if let Expr::Var(Var::Stack(off, _)) = inner.as_ref() {
+                    if !positive {
+                        *valid = false;
+                        return;
+                    }
+                    match base_offset {
+                        Some(existing) if *existing != *off => *valid = false,
+                        Some(_) => {}
+                        None => *base_offset = Some(*off),
+                    }
+                } else if positive {
+                    dynamic_parts.push(expr.clone());
+                } else {
+                    *valid = false;
+                }
+            }
+            Expr::Const(val, width) => {
+                let signed = signed_const(*val, *width);
+                if positive {
+                    *const_sum = const_sum.wrapping_add(signed);
+                } else {
+                    *const_sum = const_sum.wrapping_sub(signed);
+                }
+            }
+            _ => {
+                if positive {
+                    dynamic_parts.push(expr.clone());
+                } else {
+                    *valid = false;
+                }
+            }
+        }
+    }
+
+    fn stack_addr_base_to_c(&self, off: i64, byte_pointer: bool) -> String {
+        let name = self.stack_name(off);
+        if byte_pointer {
+            if self.buffer_sizes.contains_key(&off) {
+                format!("((uint8_t*){})", name)
+            } else {
+                format!("((uint8_t*)&{})", name)
+            }
+        } else if self.buffer_sizes.contains_key(&off) {
+            name
+        } else {
+            format!("&{}", name)
+        }
+    }
+
     /// Look up the friendly name for a stack offset, falling back to offset-based names.
     fn stack_name(&self, off: i64) -> String {
         if let Some(name) = self.var_names.get(&off) {
             return name.clone();
         }
-        if off >= 0 {
+        if self.stack_param_offsets.contains(&off) {
             format!("arg_{off:x}")
         } else {
             format!("var_{:x}", off.unsigned_abs())
@@ -3325,6 +3999,9 @@ impl<'a> CodeGenerator<'a> {
             Var::Reg(reg, _) => {
                 // Use parameter name if this is a detected register parameter
                 if let Some(name) = self.reg_params.get(reg) {
+                    return name.clone();
+                }
+                if let Some(name) = self.reg_var_names.get(reg) {
                     return name.clone();
                 }
                 format!("{reg}")
@@ -3359,6 +4036,15 @@ fn stack_type_key(off: i64) -> String {
         format!("arg_{off:x}")
     } else {
         format!("var_{:x}", off.unsigned_abs())
+    }
+}
+
+fn signed_const(val: u64, width: BitWidth) -> i64 {
+    match width {
+        BitWidth::Bit8 => val as i8 as i64,
+        BitWidth::Bit16 => val as i16 as i64,
+        BitWidth::Bit32 => val as i32 as i64,
+        BitWidth::Bit64 => val as i64,
     }
 }
 
@@ -3415,16 +4101,19 @@ enum StructuredNode {
     },
     While {
         header: BlockId,
+        exit: Option<BlockId>,
         condition: Expr,
         body: Vec<StructuredNode>,
     },
     DoWhile {
         header: BlockId,
+        exit: Option<BlockId>,
         condition: Expr,
         body: Vec<StructuredNode>,
     },
     For {
         header: BlockId,
+        exit: Option<BlockId>,
         /// Block ID of the pre-loop init block (emit all stmts except `init`).
         init_block: BlockId,
         init: Stmt,
@@ -3433,5 +4122,4 @@ enum StructuredNode {
         body: Vec<StructuredNode>,
     },
     Break,
-    Continue,
 }

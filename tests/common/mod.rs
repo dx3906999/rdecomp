@@ -7,6 +7,8 @@
 //! mod common;
 //! ```
 
+#![allow(dead_code)]
+
 use rdecomp::analysis;
 use rdecomp::arch::x86::{X86Disasm, X86Lifter};
 use rdecomp::arch::{ArchDisasm, ArchLifter};

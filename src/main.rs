@@ -4,7 +4,7 @@ use rdecomp::arch::{ArchDisasm, ArchLifter};
 use rdecomp::arch::x86::{X86Disasm, X86Lifter};
 use rdecomp::cfg::Cfg;
 use rdecomp::codegen::CodeGenerator;
-use rdecomp::ir::{CallingConv, Function};
+use rdecomp::ir::{CallingConv, Function, Stmt, Terminator};
 use rdecomp::loader::Binary;
 use rdecomp::project::{AnalyzedFunction, ProjectDb, hash_bytes};
 use std::collections::{HashMap, HashSet};
@@ -67,6 +67,32 @@ struct Cli {
 fn parse_hex(s: &str) -> Result<u64, String> {
     let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     u64::from_str_radix(s, 16).map_err(|e| format!("invalid hex address: {e}"))
+}
+
+fn is_runtime_scaffold_name(name: &str) -> bool {
+    matches!(
+        name,
+        "_init"
+            | "_start"
+            | "_fini"
+            | "__do_global_dtors_aux"
+            | "register_tm_clones"
+            | "deregister_tm_clones"
+            | "frame_dummy"
+    )
+}
+
+fn is_trivial_thunk(func: &Function) -> bool {
+    func.blocks.len() == 1
+        && func.blocks[0].stmts.iter().all(|stmt| matches!(stmt, Stmt::Nop))
+        && matches!(func.blocks[0].terminator, Terminator::IndirectJump(_) | Terminator::Unreachable)
+}
+
+fn should_skip_function_output(name: &str, addr: u64, func: Option<&Function>, binary: &Binary) -> bool {
+    if binary.plt_map.contains_key(&addr) || is_runtime_scaffold_name(name) {
+        return true;
+    }
+    func.is_some_and(is_trivial_thunk)
 }
 
 fn main() {
@@ -333,9 +359,13 @@ fn main() {
     // ── Output pass ────────────────────────────────────────────
     let mut cache_hits = 0u32;
     let mut cache_misses = 0u32;
+    let print_all_mode = cli.function.is_none() && cli.address.is_none();
 
     // Print cached outputs first, in target order
     for (name, addr, _size) in &targets {
+        if print_all_mode && should_skip_function_output(name, *addr, None, &binary) {
+            continue;
+        }
         if let Some(cached_code) = cached_outputs.get(addr) {
             println!("\n{}", "=".repeat(60));
             println!("// {} @ 0x{:x}", name, addr);
@@ -347,6 +377,9 @@ fn main() {
 
     // Print newly decompiled functions
     for (name, addr, cfg, func, bytes_hash) in &lifted {
+        if print_all_mode && should_skip_function_output(name, *addr, Some(func), &binary) {
+            continue;
+        }
         println!("\n{}", "=".repeat(60));
         println!("// {} @ 0x{:x}", name, addr);
         println!("{}", "=".repeat(60));

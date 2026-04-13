@@ -148,6 +148,12 @@ pub fn optimize_with(
     pm.run_all(func, &ctx);
 }
 
+fn block_indices_by_addr(func: &Function) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..func.blocks.len()).collect();
+    indices.sort_by_key(|&idx| (func.blocks[idx].addr, idx));
+    indices
+}
+
 /// Detect how many parameters a function takes by finding param registers
 /// that are read before being written.
 pub fn detect_param_count(func: &Function) -> usize {
@@ -155,7 +161,8 @@ pub fn detect_param_count(func: &Function) -> usize {
     let mut read_before_write: HashSet<RegId> = HashSet::new();
     let mut written: HashSet<RegId> = HashSet::new();
 
-    for block in &func.blocks {
+    for block_idx in block_indices_by_addr(func) {
+        let block = &func.blocks[block_idx];
         for stmt in &block.stmts {
             // Collect reads from RHS first
             match stmt {
@@ -1343,6 +1350,7 @@ fn propagate_copies(expr: &mut Expr, copies: &HashMap<String, Expr>) -> bool {
 /// Recover stack variables: replace RSP/RBP-relative memory accesses with named variables.
 fn stack_variable_recovery(func: &mut Function) -> bool {
     let has_fp = func.has_frame_pointer;
+    let frame_size = func.frame_size;
     let mut stack_vars: HashSet<i64> = HashSet::new();
     let mut changed = false;
 
@@ -1357,29 +1365,29 @@ fn stack_variable_recovery(func: &mut Function) -> bool {
     {
         for block in &mut func.blocks {
             for stmt in &mut block.stmts {
-                if replace_stack_refs(stmt, has_fp) {
+                if replace_stack_refs(stmt, has_fp, frame_size) {
                     changed = true;
                 }
             }
             // Also replace in terminators
             match &mut block.terminator {
                 Terminator::Branch(cond, _, _) => {
-                    if replace_stack_loads(cond, has_fp) {
+                    if replace_stack_loads(cond, has_fp, frame_size) {
                         changed = true;
                     }
                 }
                 Terminator::Return(Some(val)) => {
-                    if replace_stack_loads(val, has_fp) {
+                    if replace_stack_loads(val, has_fp, frame_size) {
                         changed = true;
                     }
                 }
                 Terminator::IndirectJump(target) => {
-                    if replace_stack_loads(target, has_fp) {
+                    if replace_stack_loads(target, has_fp, frame_size) {
                         changed = true;
                     }
                 }
                 Terminator::Switch(val, _, _) => {
-                    if replace_stack_loads(val, has_fp) {
+                    if replace_stack_loads(val, has_fp, frame_size) {
                         changed = true;
                     }
                 }
@@ -1443,43 +1451,195 @@ fn sign_extend_offset(val: u64, width: BitWidth) -> i64 {
     }
 }
 
-fn replace_stack_refs(stmt: &mut Stmt, has_fp: bool) -> bool {
+fn stack_base_reg_offset(reg: &RegId, has_frame_pointer: bool, frame_size: u64) -> Option<i64> {
+    match reg {
+        RegId::Rsp => Some(-(frame_size as i64)),
+        RegId::Rbp if has_frame_pointer => Some(0),
+        _ => None,
+    }
+}
+
+fn extract_stack_address(
+    expr: &Expr,
+    has_frame_pointer: bool,
+    frame_size: u64,
+) -> Option<(i64, Option<Expr>)> {
+    let mut base_offset: Option<i64> = None;
+    let mut const_sum = 0i64;
+    let mut dynamic_parts: Vec<Expr> = Vec::new();
+    let mut valid = true;
+
+    flatten_stack_address(
+        expr,
+        true,
+        has_frame_pointer,
+        frame_size,
+        &mut base_offset,
+        &mut const_sum,
+        &mut dynamic_parts,
+        &mut valid,
+    );
+
+    if !valid {
+        return None;
+    }
+
+    let base = base_offset?;
+    let dynamic = if dynamic_parts.is_empty() {
+        None
+    } else {
+        let mut iter = dynamic_parts.into_iter();
+        let mut acc = iter.next().unwrap();
+        for part in iter {
+            acc = Expr::binop(BinOp::Add, acc, part);
+        }
+        Some(acc)
+    };
+
+    Some((base.wrapping_add(const_sum), dynamic))
+}
+
+fn flatten_stack_address(
+    expr: &Expr,
+    positive: bool,
+    has_frame_pointer: bool,
+    frame_size: u64,
+    base_offset: &mut Option<i64>,
+    const_sum: &mut i64,
+    dynamic_parts: &mut Vec<Expr>,
+    valid: &mut bool,
+) {
+    if !*valid {
+        return;
+    }
+
+    match expr {
+        Expr::BinOp(BinOp::Add, lhs, rhs) => {
+            flatten_stack_address(
+                lhs,
+                positive,
+                has_frame_pointer,
+                frame_size,
+                base_offset,
+                const_sum,
+                dynamic_parts,
+                valid,
+            );
+            flatten_stack_address(
+                rhs,
+                positive,
+                has_frame_pointer,
+                frame_size,
+                base_offset,
+                const_sum,
+                dynamic_parts,
+                valid,
+            );
+        }
+        Expr::BinOp(BinOp::Sub, lhs, rhs) => {
+            flatten_stack_address(
+                lhs,
+                positive,
+                has_frame_pointer,
+                frame_size,
+                base_offset,
+                const_sum,
+                dynamic_parts,
+                valid,
+            );
+            flatten_stack_address(
+                rhs,
+                !positive,
+                has_frame_pointer,
+                frame_size,
+                base_offset,
+                const_sum,
+                dynamic_parts,
+                valid,
+            );
+        }
+        Expr::Var(Var::Reg(reg, _)) => {
+            let Some(base) = stack_base_reg_offset(reg, has_frame_pointer, frame_size) else {
+                if positive {
+                    dynamic_parts.push(expr.clone());
+                } else {
+                    *valid = false;
+                }
+                return;
+            };
+
+            if !positive {
+                *valid = false;
+                return;
+            }
+
+            match base_offset {
+                Some(existing) if *existing != base => *valid = false,
+                Some(_) => {}
+                None => *base_offset = Some(base),
+            }
+        }
+        Expr::Const(val, width) => {
+            let signed = sign_extend_offset(*val, *width);
+            if positive {
+                *const_sum = const_sum.wrapping_add(signed);
+            } else {
+                *const_sum = const_sum.wrapping_sub(signed);
+            }
+        }
+        _ => {
+            if positive {
+                dynamic_parts.push(expr.clone());
+            } else {
+                *valid = false;
+            }
+        }
+    }
+}
+
+fn make_stack_addr_expr(offset: i64, dynamic: Option<Expr>) -> Expr {
+    let base = Expr::UnaryOp(
+        UnaryOp::AddrOf,
+        Box::new(Expr::Var(Var::Stack(offset, BitWidth::Bit8))),
+    );
+
+    match dynamic {
+        Some(dynamic) => Expr::binop(BinOp::Add, base, dynamic),
+        None => base,
+    }
+}
+
+fn replace_stack_refs(stmt: &mut Stmt, has_fp: bool, frame_size: u64) -> bool {
     match stmt {
         Stmt::Store(addr, val, width) => {
-            if let Some(off) = extract_stack_offset(addr, has_fp) {
+            if let Some((off, None)) = extract_stack_address(addr, has_fp, frame_size) {
                 let var = Var::Stack(off, *width);
                 *stmt = Stmt::Assign(var, val.clone());
                 return true;
             }
             // Even if the full address doesn't match rsp+const,
             // recurse to replace bare rsp inside the address expression.
-            let a = replace_stack_loads(addr, has_fp);
-            let b = replace_stack_loads(val, has_fp);
+            let a = replace_stack_loads(addr, has_fp, frame_size);
+            let b = replace_stack_loads(val, has_fp, frame_size);
             a || b
         }
         Stmt::Assign(_, expr) => {
-            // Convert bare rsp/rbp or rsp+const used as pointer in RHS
-            if let Some(off) = extract_stack_offset(expr, has_fp) {
-                *expr = Expr::UnaryOp(
-                    UnaryOp::AddrOf,
-                    Box::new(Expr::Var(Var::Stack(off, BitWidth::Bit8))),
-                );
+            // Convert stack-relative pointer expressions in RHS.
+            if let Some((off, dynamic)) = extract_stack_address(expr, has_fp, frame_size) {
+                *expr = make_stack_addr_expr(off, dynamic);
                 return true;
             }
-            replace_stack_loads(expr, has_fp)
+            replace_stack_loads(expr, has_fp, frame_size)
         }
         Stmt::Call(_, target, args) => {
-            let mut changed = replace_stack_loads(target, has_fp);
+            let mut changed = replace_stack_loads(target, has_fp, frame_size);
             for arg in args.iter_mut() {
                 // Convert bare stack-relative address to &var_XX
-                if let Some(off) = extract_stack_offset(arg, has_fp) {
-                    *arg = Expr::UnaryOp(
-                        UnaryOp::AddrOf,
-                        Box::new(Expr::Var(Var::Stack(off, BitWidth::Bit8))),
-                    );
+                if let Some((off, dynamic)) = extract_stack_address(arg, has_fp, frame_size) {
+                    *arg = make_stack_addr_expr(off, dynamic);
                     changed = true;
                 } else {
-                    changed |= replace_stack_loads(arg, has_fp);
+                    changed |= replace_stack_loads(arg, has_fp, frame_size);
                 }
             }
             changed
@@ -1488,43 +1648,45 @@ fn replace_stack_refs(stmt: &mut Stmt, has_fp: bool) -> bool {
     }
 }
 
-fn replace_stack_loads(expr: &mut Expr, has_fp: bool) -> bool {
+fn replace_stack_loads(expr: &mut Expr, has_fp: bool, frame_size: u64) -> bool {
+    if !matches!(expr, Expr::Load(_, _)) {
+        if let Some((off, dynamic)) = extract_stack_address(expr, has_fp, frame_size) {
+            *expr = make_stack_addr_expr(off, dynamic);
+            return true;
+        }
+    }
+
     match expr {
         Expr::Load(addr, width) => {
-            if let Some(off) = extract_stack_offset(addr, has_fp) {
+            if let Some((off, None)) = extract_stack_address(addr, has_fp, frame_size) {
                 *expr = Expr::Var(Var::Stack(off, *width));
                 return true;
             }
             // Even if this Load isn't a direct stack access, recurse into its
             // address sub-expression (e.g. *(u32*)*(u64*)(rbp + off) — the
             // inner Load(rbp+off) should still become var_N).
-            replace_stack_loads(addr, has_fp)
-        }
-        // Bare rsp/rbp used as a pointer (not inside Load/Store): convert to &var_0
-        Expr::Var(Var::Reg(reg_id, _))
-            if *reg_id == RegId::Rsp || (has_fp && *reg_id == RegId::Rbp) =>
-        {
-            *expr = Expr::UnaryOp(
-                UnaryOp::AddrOf,
-                Box::new(Expr::Var(Var::Stack(0, BitWidth::Bit8))),
-            );
-            true
+            replace_stack_loads(addr, has_fp, frame_size)
         }
         Expr::BinOp(_, lhs, rhs) => {
-            let a = replace_stack_loads(lhs, has_fp);
-            let b = replace_stack_loads(rhs, has_fp);
+            let a = replace_stack_loads(lhs, has_fp, frame_size);
+            let b = replace_stack_loads(rhs, has_fp, frame_size);
             a || b
         }
-        Expr::UnaryOp(_, inner) => replace_stack_loads(inner, has_fp),
+        Expr::UnaryOp(_, inner) => replace_stack_loads(inner, has_fp, frame_size),
         Expr::Cmp(_, lhs, rhs) => {
-            let a = replace_stack_loads(lhs, has_fp);
-            let b = replace_stack_loads(rhs, has_fp);
+            let a = replace_stack_loads(lhs, has_fp, frame_size);
+            let b = replace_stack_loads(rhs, has_fp, frame_size);
+            a || b
+        }
+        Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
+            let a = replace_stack_loads(lhs, has_fp, frame_size);
+            let b = replace_stack_loads(rhs, has_fp, frame_size);
             a || b
         }
         Expr::Select(cond, true_val, false_val) => {
-            let a = replace_stack_loads(cond, has_fp);
-            let b = replace_stack_loads(true_val, has_fp);
-            let c = replace_stack_loads(false_val, has_fp);
+            let a = replace_stack_loads(cond, has_fp, frame_size);
+            let b = replace_stack_loads(true_val, has_fp, frame_size);
+            let c = replace_stack_loads(false_val, has_fp, frame_size);
             a || b || c
         }
         _ => false,
@@ -2662,7 +2824,7 @@ fn absorb_call_args(func: &mut Function) -> bool {
                     let chain_idxs = &param_chains[&param_idx];
                     // The first link (closest to the call) must be noppable
                     // for us to inline the expression.
-                    let first_link = *chain_idxs.iter().min().unwrap();
+                    let _first_link = *chain_idxs.iter().min().unwrap();
                     // Actually: check if the FIRST link (the param reg assignment
                     // just before the call) is noppable. If it's not, the register
                     // value will be updated before the call and shouldn't be absorbed.
@@ -3012,9 +3174,11 @@ fn substitute_param_regs(func: &mut Function) {
                         continue;
                     }
             match stmt {
-                Stmt::Call(_, _, _args) => {
-                    // Don't substitute param regs in call args — stale registers
-                    // that weren't absorbed are ABI noise, not param references.
+                Stmt::Call(_, target, args) => {
+                    substitute_param_reg_in_expr(target, &param_map);
+                    for arg in args {
+                        substitute_param_reg_in_expr(arg, &param_map);
+                    }
                 }
                 Stmt::Assign(_, expr) => {
                     substitute_param_reg_in_expr(expr, &param_map);
@@ -3033,6 +3197,12 @@ fn substitute_param_regs(func: &mut Function) {
             Terminator::Return(Some(val)) => {
                 substitute_param_reg_in_expr(val, &param_map);
             }
+            Terminator::IndirectJump(target) => {
+                substitute_param_reg_in_expr(target, &param_map);
+            }
+            Terminator::Switch(val, _, _) => {
+                substitute_param_reg_in_expr(val, &param_map);
+            }
             _ => {}
         }
     }
@@ -3045,7 +3215,8 @@ fn substitute_param_reg_in_expr(expr: &mut Expr, map: &HashMap<RegId, Var>) {
                 *expr = Expr::Var(stack_var.clone());
             }
         }
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs) => {
+        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs)
+        | Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
             substitute_param_reg_in_expr(lhs, map);
             substitute_param_reg_in_expr(rhs, map);
         }
@@ -3197,7 +3368,8 @@ fn promote_all_regs_to_locals(func: &mut Function) {
         // don't touch param regs in the entry block at all — they first
         // appear in a loop body.  We track writes globally so that a write
         // in an earlier block prevents later reads from being counted.
-        for block in &func.blocks {
+        for block_idx in block_indices_by_addr(func) {
+            let block = &func.blocks[block_idx];
             for stmt in &block.stmts {
                 // Collect reads from RHS first
                 match stmt {
@@ -3261,54 +3433,6 @@ fn promote_all_regs_to_locals(func: &mut Function) {
             }
             replace_reg_in_terminator(&mut block.terminator, reg, &temp_expr);
         }
-    }
-}
-
-fn collect_reg_ids_in_stmt(stmt: &Stmt, regs: &mut HashSet<RegId>) {
-    match stmt {
-        Stmt::Assign(Var::Reg(r, _), expr) => {
-            regs.insert(*r);
-            collect_reg_ids_in_expr(expr, regs);
-        }
-        Stmt::Assign(_, expr) => collect_reg_ids_in_expr(expr, regs),
-        Stmt::Store(addr, val, _) => {
-            collect_reg_ids_in_expr(addr, regs);
-            collect_reg_ids_in_expr(val, regs);
-        }
-        Stmt::Call(ret, target, args) => {
-            if let Some(Var::Reg(r, _)) = ret {
-                regs.insert(*r);
-            }
-            collect_reg_ids_in_expr(target, regs);
-            for a in args {
-                collect_reg_ids_in_expr(a, regs);
-            }
-        }
-        Stmt::Nop => {}
-    }
-}
-
-fn collect_reg_ids_in_terminator(term: &Terminator, regs: &mut HashSet<RegId>) {
-    match term {
-        Terminator::Branch(cond, _, _) => collect_reg_ids_in_expr(cond, regs),
-        Terminator::Return(Some(val)) => collect_reg_ids_in_expr(val, regs),
-        Terminator::IndirectJump(target) => collect_reg_ids_in_expr(target, regs),
-        Terminator::Switch(val, _, _) => collect_reg_ids_in_expr(val, regs),
-        _ => {}
-    }
-}
-
-fn collect_reg_ids_in_expr(expr: &Expr, regs: &mut HashSet<RegId>) {
-    match expr {
-        Expr::Var(Var::Reg(r, _)) => { regs.insert(*r); }
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs) => {
-            collect_reg_ids_in_expr(lhs, regs);
-            collect_reg_ids_in_expr(rhs, regs);
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            collect_reg_ids_in_expr(inner, regs);
-        }
-        _ => {}
     }
 }
 
