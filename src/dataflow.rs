@@ -278,6 +278,10 @@ pub fn reaching_definitions(func: &Function) -> HashMap<BlockId, ReachingDefs> {
             match stmt {
                 Stmt::Assign(var @ Var::Reg(_, _), expr) => {
                     let k = format!("{var}");
+                    // When a variable is reassigned, invalidate any reaching
+                    // definitions whose RHS references it — those defs are
+                    // stale and would substitute the wrong value.
+                    defs.retain(|_, def_expr| !expr_uses_key(def_expr, &k));
                     if expr_uses_key(expr, &k) {
                         defs.remove(&k);
                     } else {
@@ -455,6 +459,11 @@ pub fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
             collect_expr_vars(l, vars);
             collect_expr_vars(r, vars);
         }
+        Expr::Select(c, t, f) => {
+            collect_expr_vars(c, vars);
+            collect_expr_vars(t, vars);
+            collect_expr_vars(f, vars);
+        }
         Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
             collect_expr_vars(inner, vars);
         }
@@ -480,6 +489,9 @@ fn expr_uses_key(expr: &Expr, key: &str) -> bool {
         Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
         | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
             expr_uses_key(l, key) || expr_uses_key(r, key)
+        }
+        Expr::Select(c, t, f) => {
+            expr_uses_key(c, key) || expr_uses_key(t, key) || expr_uses_key(f, key)
         }
         Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => expr_uses_key(inner, key),
         _ => false,

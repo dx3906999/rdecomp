@@ -213,24 +213,34 @@ impl Cfg {
         };
 
         let intersect = |mut b1: u64, mut b2: u64, idom: &BTreeMap<u64, Option<u64>>, rpo_index: &BTreeMap<u64, usize>| -> u64 {
+            let max_steps = rpo.len() * 2;
+            let mut steps = 0;
             while b1 != b2 {
                 while rpo_index.get(&b1).copied().unwrap_or(usize::MAX)
                     > rpo_index.get(&b2).copied().unwrap_or(usize::MAX)
                 {
                     b1 = idom.get(&b1).copied().flatten().unwrap_or(b1);
+                    steps += 1;
+                    if steps > max_steps { return b1; }
                 }
                 while rpo_index.get(&b2).copied().unwrap_or(usize::MAX)
                     > rpo_index.get(&b1).copied().unwrap_or(usize::MAX)
                 {
                     b2 = idom.get(&b2).copied().flatten().unwrap_or(b2);
+                    steps += 1;
+                    if steps > max_steps { return b1; }
                 }
             }
             b1
         };
 
         let mut changed = true;
+        let max_iters = rpo.len() * 10;
+        let mut iters = 0;
         while changed {
             changed = false;
+            iters += 1;
+            if iters > max_iters { break; }
             for &addr in &rpo[1..] {
                 let preds = predecessors.get(&addr).cloned().unwrap_or_default();
                 let mut new_idom: Option<u64> = None;

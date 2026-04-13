@@ -47,6 +47,7 @@ pub struct Lifter {
     in_prologue: bool,
     frame_size: u64,
     has_frame_pointer: bool,
+    saw_push_rbp: bool,
 }
 
 impl Lifter {
@@ -59,6 +60,7 @@ impl Lifter {
             in_prologue: true,
             frame_size: 0,
             has_frame_pointer: false,
+            saw_push_rbp: false,
         }
     }
 
@@ -97,6 +99,7 @@ impl Lifter {
         self.in_prologue = true;
         self.frame_size = 0;
         self.has_frame_pointer = false;
+        self.saw_push_rbp = false;
 
         let addr_to_block: BTreeMap<u64, BlockId> = cfg
             .blocks
@@ -106,11 +109,42 @@ impl Lifter {
 
         let rpo = cfg.reverse_postorder();
 
+        // Track the flag state at the end of each block, keyed by block address.
+        // This allows successor blocks that consist of only a conditional branch
+        // (no flag-setting instructions of their own) to inherit the correct
+        // flag context from their predecessor.
+        let mut block_end_flags: BTreeMap<u64, Option<FlagState>> = BTreeMap::new();
+
         for &block_addr in &rpo {
             let cfg_block = match cfg.blocks.get(&block_addr) {
                 Some(b) => b,
                 None => continue,
             };
+
+            // Reset flag state at block boundaries.  For blocks whose body
+            // contains no flag-setting instructions (e.g. a bare conditional
+            // jump that tests flags from the preceding block), try to inherit
+            // the flag state from a predecessor that has already been lifted.
+            self.flag_state = None;
+            {
+                // Build a set of predecessor addresses for this block
+                let preds: Vec<u64> = cfg.blocks.iter()
+                    .filter(|(_, blk)| blk.successors.contains(&block_addr))
+                    .map(|(&addr, _)| addr)
+                    .collect();
+                // Check if this block has any flag-setting body instructions
+                let has_body_insns = cfg_block.instructions.len() > 1
+                    || (cfg_block.instructions.len() == 1 && !cfg_block.instructions[0].is_terminator());
+                if !has_body_insns {
+                    // No body instructions — inherit flag state from a predecessor
+                    for &pred_addr in &preds {
+                        if let Some(Some(fs)) = block_end_flags.get(&pred_addr) {
+                            self.flag_state = Some(fs.clone());
+                            break;
+                        }
+                    }
+                }
+            }
 
             let mut stmts = Vec::new();
             let last_idx = cfg_block.instructions.len().saturating_sub(1);
@@ -128,6 +162,9 @@ impl Lifter {
             } else {
                 Terminator::Unreachable
             };
+
+            // Save the flag state at the end of this block for successors
+            block_end_flags.insert(block_addr, self.flag_state.clone());
 
             func.blocks.push(BasicBlock {
                 id: cfg_block.block_id,
@@ -173,6 +210,8 @@ impl Lifter {
             Mnemonic::Lea => self.lift_lea(insn),
             Mnemonic::Add => self.lift_arith(insn, BinOp::Add),
             Mnemonic::Sub => self.lift_sub(insn),
+            Mnemonic::Sbb => self.lift_sbb(insn),
+            Mnemonic::Adc => self.lift_adc(insn),
             Mnemonic::Imul => self.lift_imul(insn),
             Mnemonic::Mul => self.lift_binop(insn, BinOp::Mul),
             Mnemonic::Idiv => self.lift_div(insn, true),
@@ -242,7 +281,10 @@ impl Lifter {
                 if insn.insn.op0_kind() == OpKind::Register
                     && matches!(insn.insn.op0_register(), Register::RBP | Register::EBP) =>
             {
-                self.has_frame_pointer = true;
+                // Don't set has_frame_pointer here — only set it when we also see
+                // mov rbp, rsp (the canonical frame pointer setup).
+                // A bare push rbp might just be saving a callee-saved register.
+                self.saw_push_rbp = true;
                 Some(vec![])
             }
             Mnemonic::Mov
@@ -251,6 +293,7 @@ impl Lifter {
                     && matches!(insn.insn.op0_register(), Register::RBP | Register::EBP)
                     && matches!(insn.insn.op1_register(), Register::RSP | Register::ESP) =>
             {
+                self.has_frame_pointer = true;
                 Some(vec![])
             }
             Mnemonic::Sub
@@ -419,7 +462,7 @@ impl Lifter {
     // ── condition fusion ─────────────────────────────────────────
 
     fn fuse_condition(&mut self, cc: CondCode) -> Expr {
-        let Some(st) = self.flag_state.take() else {
+        let Some(st) = self.flag_state.clone() else {
             return Expr::Cond(cc);
         };
         match st.kind {
@@ -495,13 +538,13 @@ impl Lifter {
         let dst = self.lift_operand_as_var(&insn.insn, 0);
         let src = self.lift_operand(&insn.insn, 1);
         let cc = Self::map_condition_code(insn.insn.condition_code());
-        let _cond = self.fuse_condition(cc);
+        let cond = self.fuse_condition(cc);
 
         match dst {
             Some(var) => {
-                // Emit as conditional assignment; codegen will handle
-                let _tmp = self.new_temp(var.width());
-                vec![Stmt::Assign(var, src)] // simplified
+                // Emit as: dst = cond ? src : dst
+                let select = Expr::select(cond, src, Expr::var(var.clone()));
+                vec![Stmt::Assign(var, select)]
             }
             None => vec![Stmt::Nop],
         }
@@ -558,9 +601,18 @@ impl Lifter {
         let lhs = self.lift_operand(&insn.insn, 0);
         let rhs = self.lift_operand(&insn.insn, 1);
         let result = Expr::binop(op, lhs.clone(), rhs);
+        // Use the destination variable for flag conditions when available.
+        // The assignment updates dst to the result value, so subsequent
+        // flag checks (e.g. `jne` after `shr edi,1`) should reference the
+        // already-updated variable (`edi != 0`) rather than re-evaluating
+        // the expression (`(edi >> 1) != 0` which would double-apply).
+        let flag_lhs = match &dst {
+            Some(var) => Expr::var(var.clone()),
+            None => result.clone(),
+        };
         self.flag_state = Some(FlagState {
             kind: FlagKind::Arith,
-            lhs: result.clone(),
+            lhs: flag_lhs,
             rhs: Expr::const_val(0, lhs.width()),
         });
         match dst {
@@ -579,6 +631,90 @@ impl Lifter {
             return vec![]; // epilogue stack adjustment
         }
         self.lift_arith(insn, BinOp::Sub)
+    }
+
+    /// Lift `sbb dst, src` → `dst = dst - src - CF`
+    /// CF is the carry flag from the previous cmp/sub/etc.
+    fn lift_sbb(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let dst_val = self.lift_operand(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let w = operand_width(&insn.insn, 0);
+
+        // Build the CF value as a 0/1 integer from the previous flag state
+        let cf_val = if let Some(st) = self.flag_state.clone() {
+            let cf_cond = match st.kind {
+                FlagKind::Cmp => Expr::cmp(CondCode::Below, st.lhs, st.rhs),
+                FlagKind::Arith => {
+                    // After sub/add arith, CF is complex; approximate as 0
+                    Expr::const_val(0, w)
+                }
+                FlagKind::Test => Expr::const_val(0, w), // TEST clears CF
+            };
+            Expr::select(cf_cond, Expr::const_val(1, w), Expr::const_val(0, w))
+        } else {
+            Expr::const_val(0, w)
+        };
+
+        // result = dst - src - cf
+        let sub1 = Expr::binop(BinOp::Sub, dst_val, src);
+        let result = Expr::binop(BinOp::Sub, sub1, cf_val);
+
+        self.flag_state = Some(FlagState {
+            kind: FlagKind::Arith,
+            lhs: match &dst {
+                Some(var) => Expr::var(var.clone()),
+                None => result.clone(),
+            },
+            rhs: Expr::const_val(0, w),
+        });
+
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => {
+                let addr = self.lift_memory_operand(&insn.insn, 0);
+                vec![Stmt::Store(addr, result, w)]
+            }
+        }
+    }
+
+    /// Lift `adc dst, src` → `dst = dst + src + CF`
+    fn lift_adc(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let dst_val = self.lift_operand(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let w = operand_width(&insn.insn, 0);
+
+        let cf_val = if let Some(st) = self.flag_state.clone() {
+            let cf_cond = match st.kind {
+                FlagKind::Cmp => Expr::cmp(CondCode::Below, st.lhs, st.rhs),
+                FlagKind::Arith => Expr::const_val(0, w),
+                FlagKind::Test => Expr::const_val(0, w),
+            };
+            Expr::select(cf_cond, Expr::const_val(1, w), Expr::const_val(0, w))
+        } else {
+            Expr::const_val(0, w)
+        };
+
+        let add1 = Expr::binop(BinOp::Add, dst_val, src);
+        let result = Expr::binop(BinOp::Add, add1, cf_val);
+
+        self.flag_state = Some(FlagState {
+            kind: FlagKind::Arith,
+            lhs: match &dst {
+                Some(var) => Expr::var(var.clone()),
+                None => result.clone(),
+            },
+            rhs: Expr::const_val(0, w),
+        });
+
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => {
+                let addr = self.lift_memory_operand(&insn.insn, 0);
+                vec![Stmt::Store(addr, result, w)]
+            }
+        }
     }
 
     fn lift_div(&mut self, insn: &DisasmInsn, signed: bool) -> Vec<Stmt> {
@@ -617,8 +753,19 @@ impl Lifter {
     fn lift_unary(&mut self, insn: &DisasmInsn, op: UnaryOp) -> Vec<Stmt> {
         let dst = self.lift_operand_as_var(&insn.insn, 0);
         let val = self.lift_operand(&insn.insn, 0);
+        let w = operand_width(&insn.insn, 0);
         match dst {
-            Some(var) => vec![Stmt::Assign(var, Expr::unaryop(op, val))],
+            Some(var) => {
+                // NEG sets flags like SUB 0, operand: SF/ZF/CF based on result
+                if op == UnaryOp::Neg {
+                    self.flag_state = Some(FlagState {
+                        kind: FlagKind::Arith,
+                        lhs: Expr::var(var.clone()),
+                        rhs: Expr::const_val(0, w),
+                    });
+                }
+                vec![Stmt::Assign(var, Expr::unaryop(op, val))]
+            }
             None => vec![Stmt::Nop],
         }
     }
@@ -628,9 +775,13 @@ impl Lifter {
         let val = self.lift_operand(&insn.insn, 0);
         let w = operand_width(&insn.insn, 0);
         let result = Expr::binop(op, val, Expr::const_val(1, w));
+        let flag_lhs = match &dst {
+            Some(var) => Expr::var(var.clone()),
+            None => result.clone(),
+        };
         self.flag_state = Some(FlagState {
             kind: FlagKind::Arith,
-            lhs: result.clone(),
+            lhs: flag_lhs,
             rhs: Expr::const_val(0, w),
         });
         match dst {
@@ -771,7 +922,7 @@ impl Lifter {
             }
             OpKind::Memory => {
                 let base = insn.memory_base();
-                if matches!(base, Register::RBP | Register::EBP) {
+                if self.has_frame_pointer && matches!(base, Register::RBP | Register::EBP) {
                     let disp = mem_disp_signed(insn);
                     Some(Var::Stack(disp, operand_width(insn, op_idx)))
                 } else if matches!(base, Register::RSP | Register::ESP)

@@ -276,11 +276,36 @@ fn main() {
         }
 
         let cfg = Cfg::build(&instructions);
-        let mut func = lifter.lift_function(name, *addr, &cfg, &binary);
+        let func = lifter.lift_function(name, *addr, &cfg, &binary);
 
+        lifted.push((name.clone(), *addr, cfg, func, bytes_hash));
+    }
+
+    if cli.disasm {
+        // Already printed disassembly above
+        return;
+    }
+
+    // ── Pre-pass: detect parameter counts for all lifted functions ──
+    // Skip PLT stubs (single block with only an indirect jump) since their
+    // body doesn't reveal parameter usage.
+    let callee_param_counts: HashMap<u64, usize> = lifted
+        .iter()
+        .filter(|(_, _, _, func, _)| {
+            // A PLT stub has 1 block, no statements (or only Nop), and an IndirectJump terminator
+            let is_plt = func.blocks.len() == 1
+                && func.blocks[0].stmts.iter().all(|s| matches!(s, rdecomp::ir::Stmt::Nop))
+                && matches!(func.blocks[0].terminator, rdecomp::ir::Terminator::IndirectJump(_));
+            !is_plt
+        })
+        .map(|(_, addr, _, func, _)| (*addr, analysis::detect_param_count(func)))
+        .collect();
+
+    // ── Optimization pass ──────────────────────────────────────
+    for (_, _, _, func, _) in &mut lifted {
         if !cli.no_opt {
             if cli.disable_pass.is_empty() && cli.dump_after.is_empty() {
-                analysis::optimize(&mut func, &noreturn_addrs);
+                analysis::optimize(func, &noreturn_addrs, &callee_param_counts);
             } else {
                 let mut pm = analysis::default_pass_manager();
                 for name in &cli.disable_pass {
@@ -289,16 +314,9 @@ fn main() {
                 for name in &cli.dump_after {
                     pm.dump_after.insert(name.clone());
                 }
-                analysis::optimize_with(&mut func, &pm, &noreturn_addrs);
+                analysis::optimize_with(func, &pm, &noreturn_addrs, &callee_param_counts);
             }
         }
-
-        lifted.push((name.clone(), *addr, cfg, func, bytes_hash));
-    }
-
-    if cli.disasm {
-        // Already printed disassembly above
-        return;
     }
 
     // Run interprocedural analysis on all lifted functions

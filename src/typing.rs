@@ -246,6 +246,7 @@ fn expr_type(expr: &Expr, types: &HashMap<String, CType>) -> Option<CType> {
             Some(CType::Ptr(Box::new(CType::Unknown)))
         }
         Expr::LogicalAnd(..) | Expr::LogicalOr(..) => Some(CType::Bool),
+        Expr::Select(_, t, _) => expr_type(t, types),
     }
 }
 

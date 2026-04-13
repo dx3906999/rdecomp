@@ -6,7 +6,7 @@
 //! and the CLI can selectively disable or dump after individual passes.
 
 use crate::ir::Function;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 // ── Pass trait ───────────────────────────────────────────────────
@@ -40,6 +40,8 @@ pub trait Pass {
 pub struct PassContext {
     /// Addresses of known noreturn functions.
     pub noreturn_addrs: HashSet<u64>,
+    /// Callee address → detected parameter count (from pre-pass).
+    pub callee_param_counts: HashMap<u64, usize>,
 }
 
 // ── PassManager ──────────────────────────────────────────────────

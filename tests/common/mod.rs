@@ -15,7 +15,7 @@ use rdecomp::codegen::CodeGenerator;
 use rdecomp::ir::{CallingConv, Function};
 use rdecomp::loader::Binary;
 use rdecomp::pass::PassContext;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Load a test binary from `test_file/bin/wsl/`.
@@ -120,5 +120,8 @@ fn build_pass_context(binary: &Binary) -> PassContext {
         .map(|(addr, _)| *addr)
         .collect();
 
-    PassContext { noreturn_addrs }
+    PassContext {
+        noreturn_addrs,
+        callee_param_counts: HashMap::new(),
+    }
 }

@@ -132,6 +132,18 @@ pub enum RegId {
     Xmm15,
 }
 
+impl RegId {
+    /// Returns true for SSE/XMM registers.
+    pub fn is_xmm(self) -> bool {
+        matches!(self,
+            Self::Xmm0 | Self::Xmm1 | Self::Xmm2 | Self::Xmm3
+            | Self::Xmm4 | Self::Xmm5 | Self::Xmm6 | Self::Xmm7
+            | Self::Xmm8 | Self::Xmm9 | Self::Xmm10 | Self::Xmm11
+            | Self::Xmm12 | Self::Xmm13 | Self::Xmm14 | Self::Xmm15
+        )
+    }
+}
+
 impl fmt::Display for RegId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -332,6 +344,8 @@ pub enum Expr {
     LogicalAnd(Box<Expr>, Box<Expr>),
     /// Logical OR (short-circuit): `a || b`.
     LogicalOr(Box<Expr>, Box<Expr>),
+    /// Ternary select: `cond ? true_val : false_val` (from CMOV).
+    Select(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -352,6 +366,7 @@ impl Expr {
             },
             Self::Cond(_) | Self::Cmp(..) => BitWidth::Bit8,
             Self::LogicalAnd(..) | Self::LogicalOr(..) => BitWidth::Bit8,
+            Self::Select(_, true_val, _) => true_val.width(),
         }
     }
 
@@ -378,6 +393,10 @@ impl Expr {
     pub fn cmp(cc: CondCode, lhs: Expr, rhs: Expr) -> Self {
         Self::Cmp(cc, Box::new(lhs), Box::new(rhs))
     }
+
+    pub fn select(cond: Expr, true_val: Expr, false_val: Expr) -> Self {
+        Self::Select(Box::new(cond), Box::new(true_val), Box::new(false_val))
+    }
 }
 
 impl fmt::Display for Expr {
@@ -398,6 +417,7 @@ impl fmt::Display for Expr {
             Self::Cmp(cc, lhs, rhs) => write!(f, "({lhs} {cc} {rhs})"),
             Self::LogicalAnd(lhs, rhs) => write!(f, "({lhs} && {rhs})"),
             Self::LogicalOr(lhs, rhs) => write!(f, "({lhs} || {rhs})"),
+            Self::Select(cond, t, e) => write!(f, "({cond} ? {t} : {e})"),
         }
     }
 }

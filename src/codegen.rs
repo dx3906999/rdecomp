@@ -29,6 +29,12 @@ pub struct CodeGenerator<'a> {
     func_summaries: HashMap<u64, FunctionSummary>,
     /// Temp variable IDs that are never read — suppress declaration and assignment.
     dead_temps: HashSet<u32>,
+    /// Register → parameter name mapping for leaf functions (e.g. Rdi → "arg_1").
+    reg_params: HashMap<RegId, String>,
+    /// Contextual rax value from the most recently emitted parent block.
+    /// Used to resolve `return rax` in relay blocks where the value comes
+    /// from a predecessor that was emitted as a Stmts node.
+    rax_context: Option<Expr>,
 }
 
 impl<'a> CodeGenerator<'a> {
@@ -48,6 +54,8 @@ impl<'a> CodeGenerator<'a> {
             struct_map: HashMap::new(),
             func_summaries: HashMap::new(),
             dead_temps: HashSet::new(),
+            reg_params: HashMap::new(),
+            rax_context: None,
         }
     }
 
@@ -68,6 +76,8 @@ impl<'a> CodeGenerator<'a> {
         let param_regs = func.calling_conv.param_regs();
         // param_offsets: BTreeSet of (offset, width) for stack slots that are parameters
         let mut param_offsets: BTreeSet<(i64, BitWidth)> = BTreeSet::new();
+        // For 64-bit ABIs: map offset → register index in calling convention
+        let mut offset_to_reg_idx: HashMap<i64, usize> = HashMap::new();
 
         if func.calling_conv.is_32bit() {
             let mut positive_offs: BTreeSet<(i64, BitWidth)> = BTreeSet::new();
@@ -88,7 +98,25 @@ impl<'a> CodeGenerator<'a> {
                     if let Stmt::Assign(Var::Stack(off, w), Expr::Var(Var::Reg(reg, _))) = stmt
                         && param_regs.contains(reg) {
                             param_offsets.insert((*off, *w));
+                            if let Some(idx) = param_regs.iter().position(|r| r == reg) {
+                                offset_to_reg_idx.insert(*off, idx);
+                            }
                         }
+                }
+            }
+        }
+
+        // ── Leaf function parameter detection ────────────────────
+        // For optimized leaf functions with no stack frame, detect parameter
+        // registers that are read before being written in the function body.
+        self.reg_params.clear();
+        if param_offsets.is_empty() && !func.calling_conv.is_32bit() {
+            let used_param_regs = Self::detect_reg_params(func, &param_regs);
+            let mut arg_idx = 1;
+            for reg in param_regs {
+                if used_param_regs.contains(reg) {
+                    self.reg_params.insert(*reg, format!("arg_{arg_idx}"));
+                    arg_idx += 1;
                 }
             }
         }
@@ -115,9 +143,15 @@ impl<'a> CodeGenerator<'a> {
         // ── Build friendly name map ──────────────────────────────
         let param_off_set: HashSet<i64> = param_offsets.iter().map(|(o, _)| *o).collect();
 
-        // Parameters: sorted by offset ascending → arg_1, arg_2, ...
+        // Parameters: sorted by register order (for 64-bit) or offset ascending (for 32-bit) → arg_1, arg_2, ...
         let mut param_list: Vec<(i64, BitWidth)> = param_offsets.iter().copied().collect();
-        param_list.sort_by_key(|(off, _)| *off);
+        if !offset_to_reg_idx.is_empty() {
+            // Sort by register index in calling convention (rdi=0, rsi=1, rdx=2, ...)
+            param_list.sort_by_key(|(off, _)| offset_to_reg_idx.get(off).copied().unwrap_or(usize::MAX));
+        } else {
+            // 32-bit: positive offsets sorted ascending (stack parameters)
+            param_list.sort_by_key(|(off, _)| *off);
+        }
         for (i, (off, _w)) in param_list.iter().enumerate() {
             self.var_names.insert(*off, format!("arg_{}", i + 1));
         }
@@ -148,8 +182,22 @@ impl<'a> CodeGenerator<'a> {
         let ret_type = func.return_type.to_c_str();
 
         // Function signature with parameters
-        if params.is_empty() {
+        if params.is_empty() && self.reg_params.is_empty() {
             let _ = writeln!(out, "{ret_type} {}() {{", func.name);
+        } else if !self.reg_params.is_empty() && params.is_empty() {
+            // Leaf function: parameters are register-based
+            let param_str: Vec<String> = {
+                let mut rp: Vec<_> = self.reg_params.iter().collect();
+                rp.sort_by_key(|(_, name)| (*name).clone());
+                rp.iter().map(|(reg, name)| {
+                    let reg_key = format!("{reg}");
+                    let ty = func.var_types.get(&reg_key)
+                        .map(|t| t.to_c_str())
+                        .unwrap_or("uint64_t");
+                    format!("{ty} {name}")
+                }).collect()
+            };
+            let _ = writeln!(out, "{ret_type} {}({}) {{", func.name, param_str.join(", "));
         } else {
             let param_str: Vec<String> = params.iter()
                 .map(|(name, off, w)| {
@@ -172,10 +220,16 @@ impl<'a> CodeGenerator<'a> {
 
         // Build call-result map: temp vars that hold single-use call return values
         // These will be inlined as `func(args)` instead of displaying as `t0`.
+        // Only inline when the temp is used exactly once — multi-use call results
+        // must be stored in a named local to avoid repeating the call.
+        let temp_read_counts = Self::count_temp_reads(func);
         self.call_results.clear();
         for block in &func.blocks {
             for stmt in &block.stmts {
-                if let Stmt::Call(Some(var @ Var::Temp(_, _)), target, args) = stmt {
+                if let Stmt::Call(Some(var @ Var::Temp(id, _)), target, args) = stmt {
+                    if temp_read_counts.get(id).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
                     let key = format!("{var}");
                     let target_str = self.resolve_call_target(target);
                     let args_str: Vec<String> = args.iter().map(|a| self.expr_to_c(a)).collect();
@@ -216,6 +270,7 @@ impl<'a> CodeGenerator<'a> {
         // Post-process: collapse nested if-then into short-circuit (&&)
         Self::collapse_short_circuit(&mut nodes);
         let code = self.emit_structured(&nodes, func);
+        let code = Self::fold_temp_return_lines(&code);
         out.push_str(&code);
 
         let _ = writeln!(out, "}}");
@@ -224,6 +279,108 @@ impl<'a> CodeGenerator<'a> {
 
     fn indent_str(&self) -> String {
         "    ".repeat(self.indent)
+    }
+
+    /// Post-process: fold `tN = expr; ... return tN;` into `return expr;`.
+    ///
+    /// Scans the emitted code line-by-line, tracking the last assignment to
+    /// each temp variable. When `return tN;` is found and there's a tracked
+    /// assignment, the assignment line is removed and the return inlines the
+    /// value. This handles the Branch→relay pattern where the assignment and
+    /// return come from different IR blocks.
+    fn fold_temp_return_lines(code: &str) -> String {
+        let lines: Vec<&str> = code.lines().collect();
+        let len = lines.len();
+
+        // First pass: count how many unique lines reference each temp `tN`.
+        // Only fold a temp if it appears on exactly 2 lines (assignment + return).
+        // This prevents removing assignments for temps used in conditions, stores, etc.
+        let mut temp_line_set: HashMap<String, HashSet<usize>> = HashMap::new();
+        for (line_idx, line) in lines.iter().enumerate() {
+            let bytes = line.trim().as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b't' {
+                    // Require word boundary before 't'
+                    if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                        i += 1;
+                        continue;
+                    }
+                    let mut j = i + 1;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > i + 1 {
+                        // Require word boundary after digits
+                        if j < bytes.len()
+                            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                        {
+                            i = j;
+                            continue;
+                        }
+                        let temp_name =
+                            std::str::from_utf8(&bytes[i..j]).unwrap().to_string();
+                        temp_line_set.entry(temp_name).or_default().insert(line_idx);
+                    }
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // Second pass: fold only temps that appear on exactly 2 unique lines.
+        // last_temp: temp_name → stack of (output_line_index, rhs_expression)
+        let mut last_temp: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        let mut result: Vec<Option<String>> = Vec::with_capacity(len);
+
+        for line in &lines {
+            let trimmed = line.trim();
+            // Detect `tN = expr;`
+            if let Some(rest) = trimmed.strip_prefix('t') {
+                if let Some(eq_pos) = rest.find(" = ") {
+                    let maybe_id = &rest[..eq_pos];
+                    if maybe_id.chars().all(|c| c.is_ascii_digit()) && trimmed.ends_with(';') {
+                        let temp_name = format!("t{maybe_id}");
+                        let unique_lines = temp_line_set
+                            .get(&temp_name)
+                            .map_or(0, |s| s.len());
+                        if unique_lines == 2 {
+                            let expr = &rest[eq_pos + 3..rest.len() - 1]; // strip trailing ;
+                            last_temp.entry(temp_name).or_default()
+                                .push((result.len(), expr.to_string()));
+                        }
+                        result.push(Some(line.to_string()));
+                        continue;
+                    }
+                }
+            }
+            // Detect `return tN;`
+            if let Some(rest) = trimmed.strip_prefix("return t") {
+                if rest.ends_with(';') {
+                    let maybe_id = &rest[..rest.len() - 1];
+                    if maybe_id.chars().all(|c| c.is_ascii_digit()) {
+                        let temp_name = format!("t{maybe_id}");
+                        if let Some(stack) = last_temp.get_mut(&temp_name) {
+                            if let Some((assign_idx, expr)) = stack.pop() {
+                                result[assign_idx] = None;
+                                let indent = &line[..line.len() - trimmed.len()];
+                                result.push(Some(format!("{indent}return {expr};")));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            result.push(Some(line.to_string()));
+        }
+
+        let mut out = String::new();
+        for line in result.into_iter().flatten() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
     }
 
     /// Convert `init; while(cond) { body; step; }` → `for(init; cond; step) { body; }`
@@ -474,6 +631,11 @@ impl<'a> CodeGenerator<'a> {
             Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
                 Self::collect_stack_param_candidates_from_expr(Some(inner), out);
             }
+            Expr::Select(c, t, f) => {
+                Self::collect_stack_param_candidates_from_expr(Some(c), out);
+                Self::collect_stack_param_candidates_from_expr(Some(t), out);
+                Self::collect_stack_param_candidates_from_expr(Some(f), out);
+            }
             _ => {}
         }
     }
@@ -662,6 +824,54 @@ impl<'a> CodeGenerator<'a> {
         defined.difference(&read).copied().collect()
     }
 
+    /// Count how many times each temp variable is read across the function.
+    fn count_temp_reads(func: &Function) -> HashMap<u32, usize> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        fn count_in_expr(expr: &Expr, counts: &mut HashMap<u32, usize>) {
+            match expr {
+                Expr::Var(Var::Temp(id, _)) => { *counts.entry(*id).or_insert(0) += 1; }
+                Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
+                | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
+                    count_in_expr(l, counts);
+                    count_in_expr(r, counts);
+                }
+                Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
+                    count_in_expr(inner, counts);
+                }
+                Expr::Select(c, t, f) => {
+                    count_in_expr(c, counts);
+                    count_in_expr(t, counts);
+                    count_in_expr(f, counts);
+                }
+                _ => {}
+            }
+        }
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Assign(_, expr) => count_in_expr(expr, &mut counts),
+                    Stmt::Store(addr, val, _) => {
+                        count_in_expr(addr, &mut counts);
+                        count_in_expr(val, &mut counts);
+                    }
+                    Stmt::Call(_, target, args) => {
+                        count_in_expr(target, &mut counts);
+                        for a in args { count_in_expr(a, &mut counts); }
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                Terminator::Branch(cond, _, _) => count_in_expr(cond, &mut counts),
+                Terminator::Return(Some(expr)) => count_in_expr(expr, &mut counts),
+                Terminator::Switch(val, _, _) => count_in_expr(val, &mut counts),
+                Terminator::IndirectJump(expr) => count_in_expr(expr, &mut counts),
+                _ => {}
+            }
+        }
+        counts
+    }
+
     /// Recursively collect temp variable IDs referenced in an expression.
     fn collect_temp_reads(expr: &Expr, out: &mut HashSet<u32>) {
         match expr {
@@ -679,6 +889,104 @@ impl<'a> CodeGenerator<'a> {
             Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
                 Self::collect_temp_reads(lhs, out);
                 Self::collect_temp_reads(rhs, out);
+            }
+            Expr::Select(c, t, f) => {
+                Self::collect_temp_reads(c, out);
+                Self::collect_temp_reads(t, out);
+                Self::collect_temp_reads(f, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Detect which parameter registers are actually used in a leaf function.
+    ///
+    /// Scans the function body for reads of parameter registers (rdi, rsi, ...)
+    /// that are not preceded by a local write.  Returns the set of parameter
+    /// registers that appear to be function arguments.
+    fn detect_reg_params(func: &Function, param_regs: &[RegId]) -> HashSet<RegId> {
+        // Collect all registers written to anywhere in the function
+        let mut written: HashSet<RegId> = HashSet::new();
+        // Collect all registers read from expressions
+        let mut read_before_write: HashSet<RegId> = HashSet::new();
+
+        // Walk blocks in order; for the entry block we track read-before-write
+        // precisely.  For other blocks we just check if param regs appear as
+        // reads without being written first in the function body.
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                // Collect reads from the RHS / args first (before recording write)
+                match stmt {
+                    Stmt::Assign(_, expr) => {
+                        Self::collect_reg_reads_from_expr(expr, param_regs, &written, &mut read_before_write);
+                    }
+                    Stmt::Store(addr, val, _) => {
+                        Self::collect_reg_reads_from_expr(addr, param_regs, &written, &mut read_before_write);
+                        Self::collect_reg_reads_from_expr(val, param_regs, &written, &mut read_before_write);
+                    }
+                    Stmt::Call(_, target, args) => {
+                        Self::collect_reg_reads_from_expr(target, param_regs, &written, &mut read_before_write);
+                        for a in args {
+                            Self::collect_reg_reads_from_expr(a, param_regs, &written, &mut read_before_write);
+                        }
+                    }
+                    Stmt::Nop => {}
+                }
+
+                // Now record the write
+                match stmt {
+                    Stmt::Assign(Var::Reg(reg, _), _) => { written.insert(*reg); }
+                    Stmt::Call(Some(Var::Reg(reg, _)), _, _) => { written.insert(*reg); }
+                    _ => {}
+                }
+            }
+            // Check terminator reads
+            match &block.terminator {
+                Terminator::Branch(cond, _, _) => {
+                    Self::collect_reg_reads_from_expr(cond, param_regs, &written, &mut read_before_write);
+                }
+                Terminator::Return(Some(expr)) => {
+                    Self::collect_reg_reads_from_expr(expr, param_regs, &written, &mut read_before_write);
+                }
+                Terminator::Switch(val, _, _) => {
+                    Self::collect_reg_reads_from_expr(val, param_regs, &written, &mut read_before_write);
+                }
+                Terminator::IndirectJump(expr) => {
+                    Self::collect_reg_reads_from_expr(expr, param_regs, &written, &mut read_before_write);
+                }
+                _ => {}
+            }
+        }
+
+        read_before_write
+    }
+
+    /// Recursively find parameter register reads in an expression that have not
+    /// been written yet.
+    fn collect_reg_reads_from_expr(
+        expr: &Expr,
+        param_regs: &[RegId],
+        written: &HashSet<RegId>,
+        out: &mut HashSet<RegId>,
+    ) {
+        match expr {
+            Expr::Var(Var::Reg(reg, _)) => {
+                if param_regs.contains(reg) && !written.contains(reg) {
+                    out.insert(*reg);
+                }
+            }
+            Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs)
+            | Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
+                Self::collect_reg_reads_from_expr(lhs, param_regs, written, out);
+                Self::collect_reg_reads_from_expr(rhs, param_regs, written, out);
+            }
+            Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
+                Self::collect_reg_reads_from_expr(inner, param_regs, written, out);
+            }
+            Expr::Select(c, t, f) => {
+                Self::collect_reg_reads_from_expr(c, param_regs, written, out);
+                Self::collect_reg_reads_from_expr(t, param_regs, written, out);
+                Self::collect_reg_reads_from_expr(f, param_regs, written, out);
             }
             _ => {}
         }
@@ -795,6 +1103,28 @@ impl<'a> CodeGenerator<'a> {
         exits.first().copied()
     }
 
+    /// Decide what node to emit for a loop exit: if the exit target (or its
+    /// goto-tail chain) ends with a return, inline the block as a return
+    /// statement; otherwise emit a break.
+    fn loop_exit_node(&self, func: &Function, target: BlockId) -> StructuredNode {
+        let ends_with_return = func.block(target).is_some_and(|b| {
+            match &b.terminator {
+                Terminator::Return(_) => true,
+                Terminator::Jump(j) => {
+                    let tail = self.collect_goto_tail(func, *j);
+                    tail.last().and_then(|&tb| func.block(tb))
+                        .is_some_and(|tb| matches!(tb.terminator, Terminator::Return(_)))
+                }
+                _ => false,
+            }
+        });
+        if ends_with_return {
+            StructuredNode::Block(target)
+        } else {
+            StructuredNode::Break
+        }
+    }
+
     // ── Structure recovery ───────────────────────────────────────
 
     /// Structure a region of blocks into structured nodes.
@@ -821,7 +1151,7 @@ impl<'a> CodeGenerator<'a> {
         // Defer loop-interior blocks: blocks that belong to a loop whose header
         // is in this region. They will be processed as part of the While body
         // when the header is reached, avoiding premature consumption by if-else.
-        let deferred: HashSet<BlockId> = {
+        let mut deferred: HashSet<BlockId> = {
             let mut set = HashSet::new();
             for &hdr in loop_headers {
                 if block_set.contains(&hdr) && Some(hdr) != enclosing_loop
@@ -866,31 +1196,281 @@ impl<'a> CodeGenerator<'a> {
                     .collect();
 
                 // Determine loop condition and whether this is a do-while
+                let mut while_exit_guard: Option<Expr> = None;
                 let loop_node = match &block.terminator {
                     Terminator::Branch(cond, t, f) => {
                         // Pre-tested loop: header has condition check
                         let t_in_loop = body.contains(t);
                         let f_in_loop = body.contains(f);
-                        let (condition, body_nodes) = if t_in_loop && !f_in_loop {
-                            let nodes = self.structure_region(
-                                func, cfg, &body_block_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
-                            );
-                            (cond.clone(), nodes)
+
+                        // Self-loop: header is the only block in the body.
+                        // The header's stmts execute before the condition,
+                        // so this is a do-while.
+                        if body_block_ids.is_empty() && (t_in_loop || f_in_loop) {
+                            let do_cond = if t_in_loop && !f_in_loop {
+                                cond.clone()
+                            } else {
+                                negate_condition(cond)
+                            };
+                            StructuredNode::DoWhile {
+                                header: bid,
+                                condition: do_cond,
+                                body: vec![],
+                            }
+                        } else if t_in_loop && !f_in_loop {
+                            // Check if we can fold a latch condition into the while
+                            let header_exit = *f;
+                            let latch_fold = back_edge_sources.get(&bid).and_then(|sources| {
+                                if sources.len() == 1 {
+                                    let latch = sources[0];
+                                    func.block(latch).and_then(|lb| {
+                                        if let Terminator::Branch(lcond, lt, lf) = &lb.terminator {
+                                            if *lt == bid && *lf == header_exit {
+                                                // latch: if(lcond) goto header else goto exit
+                                                // Continue condition is lcond
+                                                Some((lcond.clone(), latch))
+                                            } else if *lf == bid && *lt == header_exit {
+                                                Some((negate_condition(lcond), latch))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some((latch_cond, latch_id)) = latch_fold {
+                                // Fold: while (cond && latch_cond) { body_without_latch; latch_stmts; }
+                                let inner_ids: Vec<BlockId> = body_block_ids
+                                    .iter()
+                                    .copied()
+                                    .filter(|b| *b != latch_id)
+                                    .collect();
+                                let mut body_nodes = self.structure_region(
+                                    func, cfg, &inner_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                body_nodes.push(StructuredNode::Stmts(latch_id));
+                                while_exit_guard = Some(negate_condition(cond));
+                                StructuredNode::While {
+                                    header: bid,
+                                    condition: Expr::LogicalAnd(
+                                        Box::new(cond.clone()),
+                                        Box::new(latch_cond),
+                                    ),
+                                    body: body_nodes,
+                                }
+                            } else {
+                                let nodes = self.structure_region(
+                                    func, cfg, &body_block_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                // Guard for header_exit (f): while exits when !cond
+                                while_exit_guard = Some(negate_condition(cond));
+                                StructuredNode::While {
+                                    header: bid,
+                                    condition: cond.clone(),
+                                    body: nodes,
+                                }
+                            }
                         } else if !t_in_loop && f_in_loop {
-                            let nodes = self.structure_region(
-                                func, cfg, &body_block_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
-                            );
-                            (negate_condition(cond), nodes)
+                            // Check if we can fold a latch condition into the while
+                            let header_exit = *t;
+                            let latch_fold = back_edge_sources.get(&bid).and_then(|sources| {
+                                if sources.len() == 1 {
+                                    let latch = sources[0];
+                                    func.block(latch).and_then(|lb| {
+                                        if let Terminator::Branch(lcond, lt, lf) = &lb.terminator {
+                                            if *lt == bid && *lf == header_exit {
+                                                Some((lcond.clone(), latch))
+                                            } else if *lf == bid && *lt == header_exit {
+                                                Some((negate_condition(lcond), latch))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some((latch_cond, latch_id)) = latch_fold {
+                                let inner_ids: Vec<BlockId> = body_block_ids
+                                    .iter()
+                                    .copied()
+                                    .filter(|b| *b != latch_id)
+                                    .collect();
+                                let mut body_nodes = self.structure_region(
+                                    func, cfg, &inner_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                body_nodes.push(StructuredNode::Stmts(latch_id));
+                                while_exit_guard = Some(cond.clone());
+                                StructuredNode::While {
+                                    header: bid,
+                                    condition: Expr::LogicalAnd(
+                                        Box::new(negate_condition(cond)),
+                                        Box::new(latch_cond),
+                                    ),
+                                    body: body_nodes,
+                                }
+                            } else {
+                                let nodes = self.structure_region(
+                                    func, cfg, &body_block_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                // Guard for header_exit (t): while exits when cond
+                                while_exit_guard = Some(cond.clone());
+                                StructuredNode::While {
+                                    header: bid,
+                                    condition: negate_condition(cond),
+                                    body: nodes,
+                                }
+                            }
                         } else {
-                            let nodes = self.structure_region(
-                                func, cfg, &body_block_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
-                            );
-                            (Expr::const_val(1, BitWidth::Bit32), nodes)
-                        };
-                        StructuredNode::While {
-                            header: bid,
-                            condition,
-                            body: body_nodes,
+                            // Both targets in loop: header branch is an internal
+                            // if-then, not the loop condition.  Check the latch
+                            // for a do-while condition.
+
+                            // OR-fold: header self-loops on cond1 and has a latch
+                            // with cond2 → while (cond1 || cond2)
+                            // Pattern: header: if(cond) goto header else latch;
+                            //          latch:  if(lcond) goto header else exit;
+                            let or_fold: Option<(Expr, BlockId, BlockId)> = if (*t == bid || *f == bid) {
+                                let (self_cond, other) = if *t == bid {
+                                    (cond.clone(), *f)
+                                } else {
+                                    (negate_condition(cond), *t)
+                                };
+                                back_edge_sources.get(&bid).and_then(|sources| {
+                                    // Expect exactly 2 back-edge sources: header (self) and latch
+                                    if sources.len() != 2 { return None; }
+                                    let &latch = sources.iter().find(|&&s| s != bid)?;
+                                    if latch != other { return None; }
+                                    func.block(latch).and_then(|lb| {
+                                        if let Terminator::Branch(lcond, lt, lf) = &lb.terminator {
+                                            if *lt == bid && !body.contains(lf) {
+                                                Some((
+                                                    Expr::LogicalOr(
+                                                        Box::new(self_cond.clone()),
+                                                        Box::new(lcond.clone()),
+                                                    ),
+                                                    latch,
+                                                    *lf,
+                                                ))
+                                            } else if *lf == bid && !body.contains(lt) {
+                                                Some((
+                                                    Expr::LogicalOr(
+                                                        Box::new(self_cond.clone()),
+                                                        Box::new(negate_condition(lcond)),
+                                                    ),
+                                                    latch,
+                                                    *lt,
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            } else {
+                                None
+                            };
+
+                            if let Some((or_cond, latch_id, _exit_bid)) = or_fold {
+                                // while (cond1 || cond2) { body_without_latch; latch_stmts; }
+                                let inner_ids: Vec<BlockId> = body_block_ids
+                                    .iter()
+                                    .copied()
+                                    .filter(|b| *b != latch_id)
+                                    .collect();
+                                let mut body_nodes = self.structure_region(
+                                    func, cfg, &inner_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                body_nodes.push(StructuredNode::Stmts(latch_id));
+                                StructuredNode::While {
+                                    header: bid,
+                                    condition: or_cond,
+                                    body: body_nodes,
+                                }
+                            } else {
+
+                            let latch_cond = back_edge_sources.get(&bid).and_then(|sources| {
+                                if sources.len() == 1 {
+                                    let latch = sources[0];
+                                    func.block(latch).and_then(|lb| {
+                                        if let Terminator::Branch(lcond, lt, lf) = &lb.terminator {
+                                            let lt_in = body.contains(lt) || *lt == bid;
+                                            let lf_in = body.contains(lf) || *lf == bid;
+                                            if lt_in && !lf_in {
+                                                Some((lcond.clone(), latch))
+                                            } else if !lt_in && lf_in {
+                                                Some((negate_condition(lcond), latch))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some((do_cond, latch_id)) = latch_cond {
+                                // do-while: the header's branch is an internal
+                                // if-then inside the body.  Exclude the latch
+                                // from inner processing (its stmts will be
+                                // appended, its branch becomes the condition).
+                                let inner_ids: Vec<BlockId> = body_block_ids
+                                    .iter()
+                                    .copied()
+                                    .filter(|b| *b != latch_id)
+                                    .collect();
+                                let inner_nodes = self.structure_region(
+                                    func, cfg, &inner_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                // Build body: header's conditional branch as if-then,
+                                // then latch stmts.
+                                let mut body_nodes = Vec::new();
+                                if !inner_nodes.is_empty() {
+                                    if inner_ids.first() == Some(t) {
+                                        body_nodes.push(StructuredNode::IfThen {
+                                            condition: cond.clone(),
+                                            then_body: inner_nodes,
+                                        });
+                                    } else if inner_ids.first() == Some(f) {
+                                        body_nodes.push(StructuredNode::IfThen {
+                                            condition: negate_condition(cond),
+                                            then_body: inner_nodes,
+                                        });
+                                    } else {
+                                        body_nodes.extend(inner_nodes);
+                                    }
+                                }
+                                body_nodes.push(StructuredNode::Stmts(latch_id));
+                                StructuredNode::DoWhile {
+                                    header: bid,
+                                    condition: do_cond,
+                                    body: body_nodes,
+                                }
+                            } else {
+                                let nodes = self.structure_region(
+                                    func, cfg, &body_block_ids, loop_headers, loop_bodies, back_edge_sources, Some(bid),
+                                );
+                                StructuredNode::While {
+                                    header: bid,
+                                    condition: Expr::const_val(1, BitWidth::Bit32),
+                                    body: nodes,
+                                }
+                            }
+                            } // or_fold else
                         }
                     }
                     _ => {
@@ -956,8 +1536,77 @@ impl<'a> CodeGenerator<'a> {
 
                 result.push(loop_node);
 
-                // Skip past all body blocks
-                while i < block_ids.len() && body.contains(&block_ids[i]) {
+                // When a while-loop body has an internal exit (NOT the
+                // header's own exit) that was inlined as a return (via
+                // loop_exit_node → Block), the corresponding block should
+                // be skipped in the outer region.  Only applies to pre-
+                // tested while loops where the header has a clear exit
+                // target; do-while latch exits are the natural continuation
+                // and must NOT be skipped.
+                let header_exit: Option<BlockId> = match &block.terminator {
+                    Terminator::Branch(_, t, f) => {
+                        if body.contains(t) && !body.contains(f) { Some(*f) }
+                        else if body.contains(f) && !body.contains(t) { Some(*t) }
+                        else { None }
+                    }
+                    _ => None,
+                };
+                let mut body_inlined: HashSet<BlockId> = HashSet::new();
+                if let Some(h_exit) = header_exit {
+                    let inner_exit = self.find_loop_exit(func, body);
+                    if let Some(exit_bid) = inner_exit {
+                        // Only skip if this is NOT the header's own exit
+                        if exit_bid != h_exit {
+                            let was_inlined = func.block(exit_bid).is_some_and(|b| {
+                                match &b.terminator {
+                                    Terminator::Return(_) => true,
+                                    Terminator::Jump(j) => {
+                                        let tail = self.collect_goto_tail(func, *j);
+                                        tail.last().and_then(|&tb| func.block(tb))
+                                            .is_some_and(|tb| matches!(tb.terminator, Terminator::Return(_)))
+                                    }
+                                    _ => false,
+                                }
+                            });
+                            if was_inlined {
+                                body_inlined.insert(exit_bid);
+                            }
+
+                            // While loop has both a header_exit (condition-false path)
+                            // and an inner break exit (to exit_bid ≠ h_exit).
+                            // When the header_exit is NOT in the current region
+                            // (e.g. inside a nested loop where the exit would
+                            // otherwise be lost), emit it as a conditional return.
+                            if let Some(guard) = while_exit_guard.take() {
+                                if !block_set.contains(&h_exit) {
+                                    // Header_exit is outside this region — inline it
+                                    let h_exit_returns = func.block(h_exit).is_some_and(|b| {
+                                        match &b.terminator {
+                                            Terminator::Return(_) => true,
+                                            Terminator::Jump(j) => {
+                                                let tail = self.collect_goto_tail(func, *j);
+                                                tail.last().and_then(|&tb| func.block(tb))
+                                                    .is_some_and(|tb| matches!(tb.terminator, Terminator::Return(_)))
+                                            }
+                                            _ => false,
+                                        }
+                                    });
+                                    if h_exit_returns {
+                                        result.push(StructuredNode::IfThen {
+                                            condition: guard,
+                                            then_body: vec![StructuredNode::Block(h_exit)],
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Skip past all body blocks and body-inlined exit blocks
+                while i < block_ids.len()
+                    && (body.contains(&block_ids[i]) || body_inlined.contains(&block_ids[i]))
+                {
                     i += 1;
                 }
                 continue;
@@ -984,10 +1633,10 @@ impl<'a> CodeGenerator<'a> {
                     if Some(target) == enclosing_loop {
                         result.push(StructuredNode::Stmts(bid));
                     }
-                    // Jump to loop exit → break
+                    // Jump to loop exit → break (or return if exit is a return block)
                     else if enclosing_exit == Some(target) {
                         result.push(StructuredNode::Stmts(bid));
-                        result.push(StructuredNode::Break);
+                        result.push(self.loop_exit_node(func, target));
                     }
                     // Jump to next block in layout → fallthrough
                     else if next_in_layout == Some(target) {
@@ -1010,6 +1659,7 @@ impl<'a> CodeGenerator<'a> {
                             .is_some_and(|b| matches!(b.terminator, Terminator::Return(_)));
                         if ends_with_return {
                             result.push(StructuredNode::Block(bid));
+                            break; // goto-tail ends with return; subsequent blocks are dead
                         } else {
                             result.push(StructuredNode::Stmts(bid));
                         }
@@ -1021,37 +1671,154 @@ impl<'a> CodeGenerator<'a> {
                 }
 
                 Terminator::Branch(cond, t, f) => {
-                    let t = *t;
-                    let f = *f;
-                    let cond = cond.clone();
+                    let mut t = *t;
+                    let mut f = *f;
+                    let mut cond = cond.clone();
+                    let mut sc_skip: HashSet<BlockId> = HashSet::new();
+
+                    // Short-circuit chain folding: detect chains of empty
+                    // Branch blocks sharing a common target (AND/OR patterns).
+                    // E.g. bb0: if(!A) goto M else bb1; bb1: if(!B) goto M else bb2
+                    //   → combined: if(!A || !B) goto M else bb2
+                    // This eliminates multi-entry diamonds that cause gotos.
+                    if block.stmts.is_empty() {
+                        let mut chain_f = f;
+                        loop {
+                            if !block_set.contains(&chain_f)
+                                || loop_headers.contains(&chain_f)
+                                || deferred.contains(&chain_f)
+                            {
+                                break;
+                            }
+                            let next_blk = match func.block(chain_f) {
+                                Some(b) => b,
+                                None => break,
+                            };
+                            if !next_blk.stmts.is_empty() {
+                                break;
+                            }
+                            match &next_blk.terminator {
+                                Terminator::Branch(nc, nt, nf) => {
+                                    if *nt == t {
+                                        // f: if(nc) goto t else nf → OR
+                                        cond = Expr::LogicalOr(
+                                            Box::new(cond),
+                                            Box::new(nc.clone()),
+                                        );
+                                        sc_skip.insert(chain_f);
+                                        chain_f = *nf;
+                                        f = *nf;
+                                    } else if *nf == t {
+                                        // f: if(nc) goto nt else t → OR (negate nc)
+                                        cond = Expr::LogicalOr(
+                                            Box::new(cond),
+                                            Box::new(negate_condition(nc)),
+                                        );
+                                        sc_skip.insert(chain_f);
+                                        chain_f = *nt;
+                                        f = *nt;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        // Also try folding with t as the fallthrough target
+                        if sc_skip.is_empty() {
+                            let mut chain_t = t;
+                            loop {
+                                if !block_set.contains(&chain_t)
+                                    || loop_headers.contains(&chain_t)
+                                    || deferred.contains(&chain_t)
+                                {
+                                    break;
+                                }
+                                let next_blk = match func.block(chain_t) {
+                                    Some(b) => b,
+                                    None => break,
+                                };
+                                if !next_blk.stmts.is_empty() {
+                                    break;
+                                }
+                                match &next_blk.terminator {
+                                    Terminator::Branch(nc, nt, nf) => {
+                                        if *nt == f {
+                                            // t: if(nc) goto f else nf → chain
+                                            cond = Expr::LogicalAnd(
+                                                Box::new(cond),
+                                                Box::new(negate_condition(nc)),
+                                            );
+                                            sc_skip.insert(chain_t);
+                                            chain_t = *nf;
+                                            t = *nf;
+                                        } else if *nf == f {
+                                            // t: if(nc) goto nt else f → chain
+                                            cond = Expr::LogicalAnd(
+                                                Box::new(cond),
+                                                Box::new(nc.clone()),
+                                            );
+                                            sc_skip.insert(chain_t);
+                                            chain_t = *nt;
+                                            t = *nt;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        // Mark skipped blocks as deferred so they're not processed again
+                        for &sb in &sc_skip {
+                            deferred.insert(sb);
+                        }
+                    }
+
+                    // Recompute next_in_layout if short-circuit folding changed deferred set
+                    let next_in_layout = if !sc_skip.is_empty() {
+                        let mut j = i + 1;
+                        while j < block_ids.len()
+                            && deferred.contains(&block_ids[j])
+                            && !loop_headers.contains(&block_ids[j])
+                        {
+                            j += 1;
+                        }
+                        block_ids.get(j).copied()
+                    } else {
+                        next_in_layout
+                    };
 
                     // Check for loop back-edge branches
                     if Some(t) == enclosing_loop && Some(f) == enclosing_loop {
                         result.push(StructuredNode::Block(bid));
                     }
-                    // Branch to loop exit → break
+                    // Branch to loop exit → break (or return if exit is a return block)
                     else if enclosing_exit == Some(t) && Some(f) == enclosing_loop {
-                        // if(cond) break; else continue (implicit)
+                        // if(cond) break/return; else continue (implicit)
                         result.push(StructuredNode::Stmts(bid));
+                        let exit_node = self.loop_exit_node(func, t);
                         result.push(StructuredNode::IfThen {
                             condition: cond,
-                            then_body: vec![StructuredNode::Break],
+                            then_body: vec![exit_node],
                         });
                     }
                     else if enclosing_exit == Some(f) && Some(t) == enclosing_loop {
-                        // if(!cond) break; else continue (implicit)
+                        // if(!cond) break/return; else continue (implicit)
                         result.push(StructuredNode::Stmts(bid));
+                        let exit_node = self.loop_exit_node(func, f);
                         result.push(StructuredNode::IfThen {
                             condition: negate_condition(&cond),
-                            then_body: vec![StructuredNode::Break],
+                            then_body: vec![exit_node],
                         });
                     }
                     else if enclosing_exit == Some(t) {
-                        // if(cond) break; then fallthrough
+                        // if(cond) break/return; then fallthrough
                         result.push(StructuredNode::Stmts(bid));
+                        let exit_node = self.loop_exit_node(func, t);
                         result.push(StructuredNode::IfThen {
                             condition: cond,
-                            then_body: vec![StructuredNode::Break],
+                            then_body: vec![exit_node],
                         });
                         // f block is next (or goto)
                         if next_in_layout != Some(f) && block_set.contains(&f) {
@@ -1059,11 +1826,12 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
                     else if enclosing_exit == Some(f) {
-                        // if(!cond) break; then fallthrough
+                        // if(!cond) break/return; then fallthrough
                         result.push(StructuredNode::Stmts(bid));
+                        let exit_node = self.loop_exit_node(func, f);
                         result.push(StructuredNode::IfThen {
                             condition: negate_condition(&cond),
-                            then_body: vec![StructuredNode::Break],
+                            then_body: vec![exit_node],
                         });
                     }
                     else if Some(f) == enclosing_loop {
@@ -1251,6 +2019,7 @@ impl<'a> CodeGenerator<'a> {
 
                 Terminator::Return(_) => {
                     result.push(StructuredNode::Block(bid));
+                    break; // remaining blocks after return are dead code
                 }
 
                 _ => {
@@ -1647,10 +2416,26 @@ impl<'a> CodeGenerator<'a> {
                         if self.block_has_noreturn(block) {
                             break;
                         }
+                        // Stop emitting if this block ends with a return
+                        // (directly or via goto-tail); subsequent nodes are dead code.
+                        match &block.terminator {
+                            Terminator::Return(_) => break,
+                            Terminator::Jump(target) => {
+                                let tail = self.collect_goto_tail(func, *target);
+                                let ends_return = tail.last().and_then(|&b| func.block(b))
+                                    .is_some_and(|b| matches!(b.terminator, Terminator::Return(_)));
+                                if ends_return { break; }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 StructuredNode::Stmts(id) => {
                     if let Some(block) = func.block(*id) {
+                        // Track rax assignment for relay block resolution
+                        if let Some(expr) = self.last_rax_assignment_expr(block) {
+                            self.rax_context = Some(expr);
+                        }
                         self.emit_stmts_only(&mut out, block);
                         if self.block_has_noreturn(block) {
                             break;
@@ -1660,14 +2445,18 @@ impl<'a> CodeGenerator<'a> {
                 StructuredNode::IfThen { condition, then_body } => {
                     let _ = writeln!(out, "{}if ({}) {{", self.indent_str(), self.expr_to_c(condition));
                     self.indent += 1;
+                    let saved_rax = self.rax_context.clone();
                     out.push_str(&self.emit_structured(then_body, func));
+                    self.rax_context = saved_rax;
                     self.indent -= 1;
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
                 StructuredNode::IfThenElse { condition, then_body, else_body } => {
+                    let saved_rax = self.rax_context.clone();
                     let _ = writeln!(out, "{}if ({}) {{", self.indent_str(), self.expr_to_c(condition));
                     self.indent += 1;
                     out.push_str(&self.emit_structured(then_body, func));
+                    self.rax_context = saved_rax.clone();
                     self.indent -= 1;
                     // Check for else-if chain
                     if else_body.len() == 1 {
@@ -1676,6 +2465,7 @@ impl<'a> CodeGenerator<'a> {
                                 let _ = writeln!(out, "{}}} else if ({}) {{", self.indent_str(), self.expr_to_c(ec));
                                 self.indent += 1;
                                 out.push_str(&self.emit_structured(et, func));
+                                self.rax_context = saved_rax;
                                 self.indent -= 1;
                                 let _ = writeln!(out, "{}}}", self.indent_str());
                                 continue;
@@ -1684,10 +2474,12 @@ impl<'a> CodeGenerator<'a> {
                                 let _ = writeln!(out, "{}}} else if ({}) {{", self.indent_str(), self.expr_to_c(ec));
                                 self.indent += 1;
                                 out.push_str(&self.emit_structured(et, func));
+                                self.rax_context = saved_rax.clone();
                                 self.indent -= 1;
                                 let _ = writeln!(out, "{}}} else {{", self.indent_str());
                                 self.indent += 1;
                                 out.push_str(&self.emit_structured(ee, func));
+                                self.rax_context = saved_rax;
                                 self.indent -= 1;
                                 let _ = writeln!(out, "{}}}", self.indent_str());
                                 continue;
@@ -1698,11 +2490,14 @@ impl<'a> CodeGenerator<'a> {
                     let _ = writeln!(out, "{}}} else {{", self.indent_str());
                     self.indent += 1;
                     out.push_str(&self.emit_structured(else_body, func));
+                    self.rax_context = saved_rax;
                     self.indent -= 1;
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
                 StructuredNode::While { header, condition, body, .. } => {
-                    if body.is_empty() {
+                    let header_has_stmts = func.block(*header)
+                        .is_some_and(|b| b.stmts.iter().any(|s| !matches!(s, Stmt::Nop)));
+                    if body.is_empty() && !header_has_stmts {
                         continue;
                     }
                     // Emit header statements before the loop (initial evaluation).
@@ -1726,7 +2521,9 @@ impl<'a> CodeGenerator<'a> {
                     let _ = writeln!(out, "{}}}", self.indent_str());
                 }
                 StructuredNode::DoWhile { header, condition, body, .. } => {
-                    if body.is_empty() {
+                    let header_has_stmts = func.block(*header)
+                        .is_some_and(|b| b.stmts.iter().any(|s| !matches!(s, Stmt::Nop)));
+                    if body.is_empty() && !header_has_stmts {
                         continue;
                     }
                     let _ = writeln!(out, "{}do {{", self.indent_str());
@@ -1837,10 +2634,22 @@ impl<'a> CodeGenerator<'a> {
 
         match &block.terminator {
             Terminator::Return(val) => {
+                // If we have `return rax` but no local rax value, try predecessors,
+                // then fall back to the rax_context from the parent Stmts block.
+                if rax_return_expr.is_none() {
+                    if matches!(val, Some(Expr::Var(Var::Reg(RegId::Rax, _)))) {
+                        rax_return_expr = self.find_predecessor_rax(block.id, func)
+                            .or_else(|| self.rax_context.take());
+                    }
+                }
                 let _ = match val {
                     Some(Expr::Var(Var::Reg(RegId::Rax, _))) if rax_return_expr.is_some() => {
                         let v = rax_return_expr.as_ref().expect("checked is_some");
                         writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v))
+                    }
+                    // Bare `return rax` with no concrete value — suppress to `return;`
+                    Some(Expr::Var(Var::Reg(RegId::Rax, _))) => {
+                        writeln!(out, "{}return;", self.indent_str())
                     }
                     Some(v) => writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v)),
                     None => writeln!(out, "{}return;", self.indent_str()),
@@ -1867,6 +2676,9 @@ impl<'a> CodeGenerator<'a> {
                                         Some(Expr::Var(Var::Reg(RegId::Rax, _))) if rax_return_expr.is_some() => {
                                             let v = rax_return_expr.as_ref().expect("checked is_some");
                                             writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v))
+                                        }
+                                        Some(Expr::Var(Var::Reg(RegId::Rax, _))) => {
+                                            writeln!(out, "{}return;", self.indent_str())
                                         }
                                         Some(v) => writeln!(out, "{}return {};", self.indent_str(), self.expr_to_c(v)),
                                         None => writeln!(out, "{}return;", self.indent_str()),
@@ -1942,6 +2754,32 @@ impl<'a> CodeGenerator<'a> {
         last
     }
 
+    /// Search predecessor blocks for the rax value when the current block
+    /// is a return relay (`return rax` with no local rax assignment).
+    /// Returns Some(expr) if exactly one unique value is found across all
+    /// predecessors, so we can resolve `return rax` → `return <expr>`.
+    fn find_predecessor_rax(&self, block_id: BlockId, func: &Function) -> Option<Expr> {
+        let mut values: Vec<Expr> = Vec::new();
+        for b in &func.blocks {
+            let targets_this = match &b.terminator {
+                Terminator::Jump(t) => *t == block_id,
+                Terminator::Branch(_, t, f) => *t == block_id || *f == block_id,
+                _ => false,
+            };
+            if targets_this {
+                if let Some(expr) = self.last_rax_assignment_expr(b) {
+                    values.push(expr);
+                }
+            }
+        }
+        // If all predecessors agree on the same rax value, use it.
+        if !values.is_empty() && values.iter().all(|v| *v == values[0]) {
+            return Some(values[0].clone());
+        }
+        // If there are multiple different values, we can't resolve.
+        None
+    }
+
     // ── Statement/expression rendering ───────────────────────────
 
     fn is_noreturn_call(&self, stmt: &Stmt) -> bool {
@@ -1963,10 +2801,12 @@ impl<'a> CodeGenerator<'a> {
     fn stmt_to_c(&self, stmt: &Stmt) -> String {
         match stmt {
             Stmt::Assign(var, expr) => {
-                // Suppress all register assignments — they're ABI noise.
-                // Return-value recovery is handled by last_rax_assignment_expr.
-                if matches!(var, Var::Reg(_, _)) {
-                    return String::new();
+                // Suppress register assignments UNLESS the register is a
+                // detected parameter — those get rendered as arg_N updates.
+                if let Var::Reg(r, _) = var {
+                    if !self.reg_params.contains_key(r) {
+                        return String::new();
+                    }
                 }
                 // Suppress assignments to dead temp variables.
                 if let Var::Temp(id, _) = var {
@@ -1990,6 +2830,12 @@ impl<'a> CodeGenerator<'a> {
                             return String::new();
                         }
                 }
+                // Suppress SSE zero-init: stack_var = xmm0 (from pxor xmm0,xmm0)
+                if matches!(var, Var::Stack(_, _))
+                    && matches!(expr, Expr::Var(Var::Reg(reg, _)) if reg.is_xmm()) {
+                        let name = self.var_to_c(var);
+                        return format!("{name} = 0");
+                    }
                 format!("{} = {}", self.var_to_c(var), self.expr_to_c(expr))
             }
             Stmt::Store(addr, val, width) => {
@@ -2225,6 +3071,7 @@ impl<'a> CodeGenerator<'a> {
                 CondCode::NotSign => ">= 0".to_string(),
             },
             Expr::Cmp(cc, lhs, rhs) => {
+                let is_unsigned = matches!(cc, CondCode::Below | CondCode::BelowEq | CondCode::Above | CondCode::AboveEq);
                 let op = match cc {
                     CondCode::Eq => "==",
                     CondCode::Ne => "!=",
@@ -2235,7 +3082,27 @@ impl<'a> CodeGenerator<'a> {
                     CondCode::Sign => "<",
                     CondCode::NotSign => ">=",
                 };
-                format!("{} {} {}", self.expr_to_c(lhs), op, self.expr_to_c(rhs))
+                // For unsigned comparisons, render high-bit-set constants as hex
+                let rhs_str = if is_unsigned {
+                    if let Expr::Const(val, width) = rhs.as_ref() {
+                        let high_bit = match width {
+                            BitWidth::Bit8 => *val > 0x7F && *val <= 0xFF,
+                            BitWidth::Bit16 => *val > 0x7FFF && *val <= 0xFFFF,
+                            BitWidth::Bit32 => *val > 0x7FFF_FFFF && *val <= 0xFFFF_FFFF,
+                            BitWidth::Bit64 => *val > 0x7FFF_FFFF_FFFF_FFFF,
+                        };
+                        if high_bit {
+                            format!("0x{val:x}")
+                        } else {
+                            self.expr_to_c(rhs)
+                        }
+                    } else {
+                        self.expr_to_c(rhs)
+                    }
+                } else {
+                    self.expr_to_c(rhs)
+                };
+                format!("{} {} {}", self.expr_to_c(lhs), op, rhs_str)
             }
             Expr::LogicalAnd(lhs, rhs) => {
                 format!("({} && {})", self.expr_to_c(lhs), self.expr_to_c(rhs))
@@ -2243,7 +3110,74 @@ impl<'a> CodeGenerator<'a> {
             Expr::LogicalOr(lhs, rhs) => {
                 format!("({} || {})", self.expr_to_c(lhs), self.expr_to_c(rhs))
             }
+            Expr::Select(cond, t, f) => {
+                // Recognize abs() patterns
+                if let Some(abs_expr) = self.try_simplify_abs(cond, t, f) {
+                    return abs_expr;
+                }
+                format!("({} ? {} : {})", self.expr_to_c(cond), self.expr_to_c(t), self.expr_to_c(f))
+            }
         }
+    }
+
+    /// Try to simplify a Select into abs(x).
+    /// Recognizes variants:
+    ///   Select(Cmp(Lt, -x, 0), x, -x) → abs(x)
+    ///   Select(Cmp(Ge, -x, 0), -x, x) → abs(x)
+    ///   Select(Cmp(Lt, x, 0), -x, x)  → abs(x)
+    ///   Select(Cmp(Ge, x, 0), x, -x)  → abs(x)
+    fn try_simplify_abs(&self, cond: &Expr, t: &Expr, f: &Expr) -> Option<String> {
+        if let Expr::Cmp(cc, cmp_lhs, cmp_rhs) = cond {
+            let is_zero = matches!(cmp_rhs.as_ref(), Expr::Const(0, _));
+            if !is_zero { return None; }
+
+            match cc {
+                // Select(Cmp(Lt, -x, 0), x, -x) → abs(x)
+                // Select(Cmp(Sign, -x, 0), x, -x) → abs(x)
+                CondCode::Lt | CondCode::Sign => {
+                    if let Expr::UnaryOp(UnaryOp::Neg, inner) = cmp_lhs.as_ref() {
+                        if inner.as_ref() == t {
+                            if let Expr::UnaryOp(UnaryOp::Neg, f_inner) = f {
+                                if f_inner.as_ref() == t {
+                                    return Some(format!("abs({})", self.expr_to_c(t)));
+                                }
+                            }
+                        }
+                    }
+                    // Select(Cmp(Lt, x, 0), -x, x) → abs(x)
+                    if cmp_lhs.as_ref() == f {
+                        if let Expr::UnaryOp(UnaryOp::Neg, t_inner) = t {
+                            if t_inner.as_ref() == f {
+                                return Some(format!("abs({})", self.expr_to_c(f)));
+                            }
+                        }
+                    }
+                }
+                // Select(Cmp(Ge, -x, 0), -x, x) → abs(x)
+                // Select(Cmp(NotSign, -x, 0), -x, x) → abs(x)
+                CondCode::Ge | CondCode::NotSign => {
+                    if let Expr::UnaryOp(UnaryOp::Neg, inner) = cmp_lhs.as_ref() {
+                        if inner.as_ref() == f {
+                            if let Expr::UnaryOp(UnaryOp::Neg, t_inner) = t {
+                                if t_inner.as_ref() == f {
+                                    return Some(format!("abs({})", self.expr_to_c(f)));
+                                }
+                            }
+                        }
+                    }
+                    // Select(Cmp(Ge, x, 0), x, -x) → abs(x)
+                    if cmp_lhs.as_ref() == t {
+                        if let Expr::UnaryOp(UnaryOp::Neg, f_inner) = f {
+                            if f_inner.as_ref() == t {
+                                return Some(format!("abs({})", self.expr_to_c(t)));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Get the struct map key for a Var if it's in our struct_map.
@@ -2388,7 +3322,13 @@ impl<'a> CodeGenerator<'a> {
 
     fn var_to_c(&self, var: &Var) -> String {
         match var {
-            Var::Reg(reg, _) => format!("{reg}"),
+            Var::Reg(reg, _) => {
+                // Use parameter name if this is a detected register parameter
+                if let Some(name) = self.reg_params.get(reg) {
+                    return name.clone();
+                }
+                format!("{reg}")
+            }
             Var::Stack(off, _) => self.stack_name(*off),
             Var::Temp(id, _) => {
                 let key = format!("t{id}");
