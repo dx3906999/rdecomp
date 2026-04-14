@@ -623,6 +623,7 @@ impl<'a> CodeGenerator<'a> {
                             None => base,
                         };
                     }
+                let is_shift = matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Sar | BinOp::Rol | BinOp::Ror);
                 let op_str = match op {
                     BinOp::Add => "+",
                     BinOp::Sub => "-",
@@ -641,7 +642,13 @@ impl<'a> CodeGenerator<'a> {
                     BinOp::Ult | BinOp::Slt => "<",
                     BinOp::Ule | BinOp::Sle => "<=",
                 };
-                format!("({} {} {})", self.expr_to_c(lhs), op_str, self.expr_to_c(rhs))
+                // Shift amounts must never be rendered as char literals.
+                let rhs_str = if is_shift {
+                    Self::const_to_numeric(rhs).unwrap_or_else(|| self.expr_to_c(rhs))
+                } else {
+                    self.expr_to_c(rhs)
+                };
+                format!("({} {} {})", self.expr_to_c(lhs), op_str, rhs_str)
             }
             Expr::UnaryOp(op, inner) => match op {
                 UnaryOp::Neg => format!("(-{})", self.expr_to_c(inner)),
@@ -712,20 +719,25 @@ impl<'a> CodeGenerator<'a> {
                 }
                 format!("*({}*)({})", c_type(*width), self.expr_to_c(addr))
             }
-            Expr::Cond(cc) => match cc {
-                CondCode::Eq => "==".to_string(),
-                CondCode::Ne => "!=".to_string(),
-                CondCode::Lt => "<".to_string(),
-                CondCode::Le => "<=".to_string(),
-                CondCode::Gt => ">".to_string(),
-                CondCode::Ge => ">=".to_string(),
-                CondCode::Below => "<".to_string(),
-                CondCode::BelowEq => "<=".to_string(),
-                CondCode::Above => ">".to_string(),
-                CondCode::AboveEq => ">=".to_string(),
-                CondCode::Sign => "< 0".to_string(),
-                CondCode::NotSign => ">= 0".to_string(),
-            },
+            // A bare Cond can appear when the lifter lost track of which
+            // operands set the flag (e.g. optimized code with flag reuse).
+            // Emit a symbolic placeholder instead of a constant so branch
+            // structure is preserved in generated pseudocode.
+            Expr::Cond(cc) => {
+                let cc_name = match cc {
+                    CondCode::Eq       => "eq",
+                    CondCode::Ne       => "ne",
+                    CondCode::Lt | CondCode::Sign => "lt",
+                    CondCode::Le       => "le",
+                    CondCode::Gt | CondCode::NotSign => "gt",
+                    CondCode::Ge       => "ge",
+                    CondCode::Below    => "b",
+                    CondCode::BelowEq  => "be",
+                    CondCode::Above    => "a",
+                    CondCode::AboveEq  => "ae",
+                };
+                format!("flag_{cc_name} /* unresolved condition */")
+            }
             Expr::Cmp(cc, lhs, rhs) => {
                 let is_unsigned = matches!(cc, CondCode::Below | CondCode::BelowEq | CondCode::Above | CondCode::AboveEq);
                 let op = match cc {
@@ -1049,6 +1061,20 @@ impl<'a> CodeGenerator<'a> {
                     *valid = false;
                 }
             }
+        }
+    }
+
+    /// Format a constant expression purely as a number, bypassing char-literal
+    /// and string-pointer heuristics.  Returns `None` if `expr` is not a Const.
+    pub(crate) fn const_to_numeric(expr: &Expr) -> Option<String> {
+        if let Expr::Const(val, _) = expr {
+            if *val > 9 {
+                Some(format!("0x{val:x}"))
+            } else {
+                Some(format!("{val}"))
+            }
+        } else {
+            None
         }
     }
 

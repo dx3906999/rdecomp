@@ -352,6 +352,7 @@ impl<'a> CodeGenerator<'a> {
         self.emitted_labels.clear();
         let code = self.emit_structured(&nodes, func);
         let code = Self::fold_temp_return_lines(&code);
+        let code = Self::fold_conditional_goto_fallthrough(&code);
         out.push_str(&code);
 
         let _ = writeln!(out, "}}");
@@ -466,6 +467,110 @@ impl<'a> CodeGenerator<'a> {
             out.push('\n');
         }
         out
+    }
+
+    /// Fold `if (cond) goto A; else goto B;` when either `A:` or `B:` is the
+    /// next emitted label (fallthrough arm). This keeps semantics while
+    /// removing one redundant goto in each matched case.
+    fn fold_conditional_goto_fallthrough(code: &str) -> String {
+        let lines: Vec<&str> = code.lines().collect();
+        let mut out: Vec<String> = Vec::with_capacity(lines.len());
+
+        // Collect labels that map to a short tail ending in return.
+        // This captures common relay blocks like:
+        //   bb37:
+        //     t0 = ...;
+        //     return t0;
+        let mut label_return_tail: HashMap<String, Vec<String>> = HashMap::new();
+        for i in 0..lines.len() {
+            let t = lines[i].trim();
+            if !t.ends_with(':') {
+                continue;
+            }
+            let label = t.trim_end_matches(':').trim().to_string();
+            let mut j = i + 1;
+            let mut body: Vec<String> = Vec::new();
+            while j < lines.len() {
+                let s = lines[j].trim();
+                if s.is_empty() {
+                    j += 1;
+                    continue;
+                }
+                if s.ends_with(':') {
+                    break;
+                }
+                body.push(s.to_string());
+                j += 1;
+            }
+            if body.is_empty() || body.len() > 2 {
+                continue;
+            }
+            if body.iter().any(|s| s.contains("goto ")) {
+                continue;
+            }
+            let Some(last) = body.last() else { continue; };
+            if last.starts_with("return ") || last == "return;" {
+                label_return_tail.insert(label, body);
+            }
+        }
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let indent = &line[..line.len() - trimmed.len()];
+
+            if let Some(rest) = trimmed.strip_prefix("if (")
+                && let Some(mid) = rest.find("; else goto ")
+                && let Some(rhs) = rest[mid + "; else goto ".len()..].strip_suffix(';')
+            {
+                let lhs = &rest[..mid]; // `cond) goto L1`
+                if let Some(pos) = lhs.rfind(") goto ") {
+                    let cond = &lhs[..pos];
+                    let l1 = lhs[pos + ") goto ".len()..].trim();
+                    let l2 = rhs.trim();
+
+                    let mut next_label: Option<&str> = None;
+                    for next in lines.iter().skip(i + 1) {
+                        let t = next.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        if t.ends_with(':') {
+                            next_label = Some(t.trim_end_matches(':').trim());
+                        }
+                        break;
+                    }
+
+                    if next_label == Some(l1) {
+                        out.push(format!("{indent}if (!({cond})) goto {l2};"));
+                        continue;
+                    }
+                    if next_label == Some(l2) {
+                        out.push(format!("{indent}if ({cond}) goto {l1};"));
+                        continue;
+                    }
+
+                    // Inline a return-only destination to avoid one goto.
+                    if let Some(ret_tail) = label_return_tail.get(l1) {
+                        out.push(format!("{indent}if (!({cond})) goto {l2};"));
+                        for stmt in ret_tail {
+                            out.push(format!("{indent}{stmt}"));
+                        }
+                        continue;
+                    }
+                    if let Some(ret_tail) = label_return_tail.get(l2) {
+                        out.push(format!("{indent}if ({cond}) goto {l1};"));
+                        for stmt in ret_tail {
+                            out.push(format!("{indent}{stmt}"));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            out.push((*line).to_string());
+        }
+
+        out.join("\n") + "\n"
     }
 
     /// Convert `init; while(cond) { body; step; }` into `for(init; cond; step) { body; }`.

@@ -132,10 +132,14 @@ impl Lifter {
                     .filter(|(_, blk)| blk.successors.contains(&block_addr))
                     .map(|(&addr, _)| addr)
                     .collect();
-                // Check if this block has any flag-setting body instructions
-                let has_body_insns = cfg_block.instructions.len() > 1
-                    || (cfg_block.instructions.len() == 1 && !cfg_block.instructions[0].is_terminator());
-                if !has_body_insns {
+                // Check whether this block body contains any instruction that
+                // overwrites the condition flags.  If not, a trailing Jcc may
+                // still be testing flags produced by a predecessor.
+                let has_flag_writers = cfg_block.instructions
+                    .iter()
+                    .filter(|insn| !insn.is_terminator())
+                    .any(|insn| Self::mnemonic_sets_flags(insn.mnemonic));
+                if !has_flag_writers {
                     // No body instructions — inherit flag state from a predecessor
                     for &pred_addr in &preds {
                         if let Some(Some(fs)) = block_end_flags.get(&pred_addr) {
@@ -271,6 +275,35 @@ impl Lifter {
             Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Int3 => vec![],
             _ => vec![Stmt::Nop],
         }
+    }
+
+    /// Conservative check for instructions that update arithmetic/logic flags
+    /// relevant for subsequent Jcc fusion.
+    fn mnemonic_sets_flags(m: Mnemonic) -> bool {
+        matches!(
+            m,
+            Mnemonic::Add
+                | Mnemonic::Sub
+                | Mnemonic::Sbb
+                | Mnemonic::Adc
+                | Mnemonic::Imul
+                | Mnemonic::Mul
+                | Mnemonic::Idiv
+                | Mnemonic::Div
+                | Mnemonic::And
+                | Mnemonic::Or
+                | Mnemonic::Xor
+                | Mnemonic::Shl
+                | Mnemonic::Shr
+                | Mnemonic::Sar
+                | Mnemonic::Rol
+                | Mnemonic::Ror
+                | Mnemonic::Inc
+                | Mnemonic::Dec
+                | Mnemonic::Neg
+                | Mnemonic::Cmp
+                | Mnemonic::Test
+        )
     }
 
     // ── prologue / epilogue ──────────────────────────────────────
