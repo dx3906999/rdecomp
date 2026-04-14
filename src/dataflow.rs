@@ -452,23 +452,11 @@ fn parse_stack_key(key: &str) -> Option<i64> {
 
 /// Collect all variable keys referenced in an expression.
 pub fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<String>) {
-    match expr {
-        Expr::Var(v) => { vars.insert(format!("{v}")); }
-        Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
-        | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
-            collect_expr_vars(l, vars);
-            collect_expr_vars(r, vars);
+    expr.walk(&mut |e| {
+        if let Expr::Var(v) = e {
+            vars.insert(format!("{v}"));
         }
-        Expr::Select(c, t, f) => {
-            collect_expr_vars(c, vars);
-            collect_expr_vars(t, vars);
-            collect_expr_vars(f, vars);
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            collect_expr_vars(inner, vars);
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Collect all variable keys referenced in a terminator.
@@ -484,16 +472,5 @@ pub fn collect_terminator_vars(term: &Terminator, vars: &mut HashSet<String>) {
 
 /// Check if an expression uses a variable by its string key.
 fn expr_uses_key(expr: &Expr, key: &str) -> bool {
-    match expr {
-        Expr::Var(v) => format!("{v}") == key,
-        Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
-        | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
-            expr_uses_key(l, key) || expr_uses_key(r, key)
-        }
-        Expr::Select(c, t, f) => {
-            expr_uses_key(c, key) || expr_uses_key(t, key) || expr_uses_key(f, key)
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => expr_uses_key(inner, key),
-        _ => false,
-    }
+    expr.any(&|e| matches!(e, Expr::Var(v) if format!("{v}") == key))
 }

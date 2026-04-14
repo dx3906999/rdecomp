@@ -397,6 +397,65 @@ impl Expr {
     pub fn select(cond: Expr, true_val: Expr, false_val: Expr) -> Self {
         Self::Select(Box::new(cond), Box::new(true_val), Box::new(false_val))
     }
+
+    /// Returns true if this expression or any sub-expression satisfies the predicate.
+    pub fn any(&self, pred: &dyn Fn(&Expr) -> bool) -> bool {
+        if pred(self) {
+            return true;
+        }
+        match self {
+            Self::BinOp(_, l, r)
+            | Self::Cmp(_, l, r)
+            | Self::LogicalAnd(l, r)
+            | Self::LogicalOr(l, r) => l.any(pred) || r.any(pred),
+            Self::UnaryOp(_, inner) | Self::Load(inner, _) => inner.any(pred),
+            Self::Select(c, t, f) => c.any(pred) || t.any(pred) || f.any(pred),
+            _ => false,
+        }
+    }
+
+    /// Calls `f` on this expression and all sub-expressions (pre-order).
+    pub fn walk(&self, f: &mut dyn FnMut(&Expr)) {
+        f(self);
+        match self {
+            Self::BinOp(_, l, r)
+            | Self::Cmp(_, l, r)
+            | Self::LogicalAnd(l, r)
+            | Self::LogicalOr(l, r) => {
+                l.walk(f);
+                r.walk(f);
+            }
+            Self::UnaryOp(_, inner) | Self::Load(inner, _) => inner.walk(f),
+            Self::Select(c, t, f_) => {
+                c.walk(f);
+                t.walk(f);
+                f_.walk(f);
+            }
+            _ => {}
+        }
+    }
+
+    /// Calls `f` on sub-expressions first (bottom-up), then on self.
+    /// Safe for leaf replacement: replaced nodes' children are not revisited.
+    pub fn walk_mut(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+        match self {
+            Self::BinOp(_, l, r)
+            | Self::Cmp(_, l, r)
+            | Self::LogicalAnd(l, r)
+            | Self::LogicalOr(l, r) => {
+                l.walk_mut(f);
+                r.walk_mut(f);
+            }
+            Self::UnaryOp(_, inner) | Self::Load(inner, _) => inner.walk_mut(f),
+            Self::Select(c, t, e) => {
+                c.walk_mut(f);
+                t.walk_mut(f);
+                e.walk_mut(f);
+            }
+            _ => {}
+        }
+        f(self);
+    }
 }
 
 impl fmt::Display for Expr {

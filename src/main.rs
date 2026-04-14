@@ -62,6 +62,11 @@ struct Cli {
     /// List all analysis passes and exit.
     #[arg(long)]
     list_passes: bool,
+
+    /// Use IDA Hex-Rays style types and naming in output
+    /// (e.g. _DWORD instead of uint32_t, LABEL_N instead of bbN).
+    #[arg(long)]
+    ida_style: bool,
 }
 
 fn parse_hex(s: &str) -> Result<u64, String> {
@@ -237,7 +242,7 @@ fn main() {
         (_, rdecomp::loader::BinaryFormat::Pe) => lifter.set_calling_conv(CallingConv::Win64),
         _ => {}
     }
-    let mut codegen = CodeGenerator::new(&binary.functions, &binary);
+    let mut codegen = CodeGenerator::new(&binary.functions, &binary, cli.ida_style);
 
     let noreturn_addrs: HashSet<u64> = binary
         .plt_map

@@ -56,7 +56,38 @@ pub fn decompile_function(binary: &Binary, func_name: &str) -> String {
     let pm = analysis::default_pass_manager();
     pm.run_all(&mut func, &ctx);
 
-    let mut codegen = CodeGenerator::new(&binary.functions, binary);
+    let mut codegen = CodeGenerator::new(&binary.functions, binary, false);
+    codegen.generate(&mut func, &cfg)
+}
+
+/// Full pipeline with configurable codegen style.
+pub fn decompile_function_with_style(binary: &Binary, func_name: &str, ida_style: bool) -> String {
+    let func_sym = binary
+        .functions
+        .iter()
+        .find(|f| f.name == func_name)
+        .unwrap_or_else(|| panic!("function '{}' not found in binary", func_name));
+
+    let addr = func_sym.addr;
+    let size = infer_function_size(binary, func_sym);
+
+    let disasm: Box<dyn ArchDisasm> = Box::new(X86Disasm);
+    let instructions = disasm
+        .disassemble_function(binary, addr, size)
+        .expect("disassembly failed");
+
+    let cfg = Cfg::build(&instructions);
+
+    let mut lifter: Box<dyn ArchLifter> = Box::new(X86Lifter::new(binary.arch));
+    apply_calling_conv(binary, &mut *lifter);
+
+    let mut func = lifter.lift_function(&func_sym.name, addr, &cfg, binary);
+
+    let ctx = build_pass_context(binary);
+    let pm = analysis::default_pass_manager();
+    pm.run_all(&mut func, &ctx);
+
+    let mut codegen = CodeGenerator::new(&binary.functions, binary, ida_style);
     codegen.generate(&mut func, &cfg)
 }
 

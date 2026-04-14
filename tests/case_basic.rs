@@ -10,21 +10,29 @@ mod common;
 fn case1_classify_decompiles() {
     let binary = common::load_wsl_binary("case1_control");
     let output = common::decompile_function(&binary, "classify");
-    assert!(output.contains("classify"), "should contain function name");
-    assert!(output.contains("return"), "should have return statements");
-    assert!(output.contains("if"), "should have if statements");
+    // Verify function signature
+    assert!(output.contains("classify("), "should have function signature");
+    assert!(output.contains("arg_1"), "should have parameter");
+    // Verify all four return paths exist
+    assert!(output.contains("return 0"), "should return 0 for zero input");
+    assert!(output.contains("return 1"), "should return 1 for small positive");
+    assert!(output.contains("return 2"), "should return 2 for large number");
+    assert!(output.contains("return -1") || output.contains("return 0xffffffff"),
+        "should return -1 for negative input");
+    // Verify structured control flow (no gotos)
+    assert!(!output.contains("goto"), "should have clean control flow without gotos");
 }
 
 #[test]
 fn case1_classify_returns_correct_values() {
     let binary = common::load_wsl_binary("case1_control");
     let output = common::decompile_function(&binary, "classify");
-    let has_return_values =
-        output.contains("return 0") || output.contains("return 1") || output.contains("return 2");
-    assert!(
-        has_return_values,
-        "should contain return constants, got:\n{output}"
-    );
+    // Should have exactly one parameter
+    let param_count = output.lines()
+        .find(|l| l.contains("classify("))
+        .map(|l| l.matches("arg_").count())
+        .unwrap_or(0);
+    assert_eq!(param_count, 1, "classify should have exactly 1 parameter");
 }
 
 #[test]
@@ -32,10 +40,12 @@ fn case1_sum_to_n_has_loop() {
     let binary = common::load_wsl_binary("case1_control");
     let output = common::decompile_function(&binary, "sum_to_n");
     let has_loop = output.contains("while") || output.contains("for");
-    assert!(
-        has_loop,
-        "sum_to_n should have a loop construct, got:\n{output}"
-    );
+    assert!(has_loop, "sum_to_n should have a loop construct, got:\n{output}");
+    // Should have exactly one parameter and a return
+    assert!(output.contains("arg_1"), "should have a parameter");
+    assert!(output.contains("return"), "should have a return statement");
+    // Should not have any gotos (clean structured output)
+    assert!(!output.contains("goto"), "loop should be structured without gotos");
 }
 
 // ═══════════════════════════════════════════════════════════════

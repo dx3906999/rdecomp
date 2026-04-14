@@ -174,7 +174,7 @@ pub fn detect_param_count(func: &Function) -> usize {
                     collect_param_reads(val, param_regs, &written, &mut read_before_write);
                 }
                 Stmt::Call(_, target, _args) => {
-                    // Only check the call target, NOT the args — raw call args
+                    // Only check the call target, NOT the args -- raw call args
                     // contain all 6 ABI registers as noise before trim_call_args runs.
                     collect_param_reads(target, param_regs, &written, &mut read_before_write);
                 }
@@ -397,19 +397,7 @@ fn eliminate_stack_canary(func: &mut Function) {
 
 /// Check if an expression references the stack canary sentinel address.
 fn expr_references_canary(expr: &Expr) -> bool {
-    match expr {
-        Expr::Const(v, _) => *v == FS_CANARY_ADDR,
-        Expr::Load(addr, _) => expr_references_canary(addr),
-        Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
-        | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
-            expr_references_canary(l) || expr_references_canary(r)
-        }
-        Expr::Select(c, t, f) => {
-            expr_references_canary(c) || expr_references_canary(t) || expr_references_canary(f)
-        }
-        Expr::UnaryOp(_, inner) => expr_references_canary(inner),
-        _ => false,
-    }
+    expr.any(&|e| matches!(e, Expr::Const(v, _) if *v == FS_CANARY_ADDR))
 }
 
 // ── Zero-init buffer folding ─────────────────────────────────────
@@ -722,219 +710,8 @@ fn fold_expr(expr: &Expr) -> Option<Expr> {
 
     // Now try to fold the (potentially updated) expression
     let folded_top = match expr.as_ref() {
-        Expr::BinOp(op, lhs, rhs) => {
-            if let (Expr::Const(l, w), Expr::Const(r, _)) = (lhs.as_ref(), rhs.as_ref()) {
-                let result = match op {
-                    BinOp::Add => Some(l.wrapping_add(*r)),
-                    BinOp::Sub => Some(l.wrapping_sub(*r)),
-                    BinOp::Mul => Some(l.wrapping_mul(*r)),
-                    BinOp::And => Some(l & r),
-                    BinOp::Or => Some(l | r),
-                    BinOp::Xor => Some(l ^ r),
-                    BinOp::Shl => Some(l.wrapping_shl(*r as u32)),
-                    BinOp::Shr => Some(l.wrapping_shr(*r as u32)),
-                    BinOp::Rol => Some(l.rotate_left(*r as u32)),
-                    BinOp::Ror => Some(l.rotate_right(*r as u32)),
-                    _ => None,
-                };
-                if let Some(val) = result {
-                    return Some(Expr::Const(val, *w));
-                }
-            }
-
-            // Algebraic simplifications
-            match op {
-                BinOp::Add => {
-                    if matches!(rhs.as_ref(), Expr::Const(0, _)) {
-                        return Some(*lhs.clone());
-                    }
-                    if matches!(lhs.as_ref(), Expr::Const(0, _)) {
-                        return Some(*rhs.clone());
-                    }
-                    // x + x → x << 1  (compiler strength-reduction for *2)
-                    if lhs == rhs {
-                        return Some(Expr::BinOp(
-                            BinOp::Shl,
-                            lhs.clone(),
-                            Box::new(Expr::Const(1, BitWidth::Bit8)),
-                        ));
-                    }
-                }
-                BinOp::Sub => {
-                    if matches!(rhs.as_ref(), Expr::Const(0, _)) {
-                        return Some(*lhs.clone());
-                    }
-                    // Sub(0, x) → Neg(x)
-                    if matches!(lhs.as_ref(), Expr::Const(0, _)) {
-                        return Some(Expr::UnaryOp(UnaryOp::Neg, rhs.clone()));
-                    }
-                    // Sub(x, negative_const) → Add(x, -negative_const)
-                    // e.g. Sub(x, 0xFFFFFFFF) → Add(x, 1) for 32-bit
-                    if let Expr::Const(c, w) = rhs.as_ref() {
-                        let is_neg = match w {
-                            BitWidth::Bit8 => *c > 0x7F && *c <= 0xFF,
-                            BitWidth::Bit16 => *c > 0x7FFF && *c <= 0xFFFF,
-                            BitWidth::Bit32 => *c > 0x7FFF_FFFF && *c <= 0xFFFF_FFFF,
-                            BitWidth::Bit64 => *c > 0x7FFF_FFFF_FFFF_FFFF,
-                        };
-                        if is_neg {
-                            let neg_c = match w {
-                                BitWidth::Bit8 => (!*c).wrapping_add(1) & 0xFF,
-                                BitWidth::Bit16 => (!*c).wrapping_add(1) & 0xFFFF,
-                                BitWidth::Bit32 => (!*c).wrapping_add(1) & 0xFFFF_FFFF,
-                                BitWidth::Bit64 => (!*c).wrapping_add(1),
-                            };
-                            return Some(Expr::BinOp(
-                                BinOp::Add,
-                                lhs.clone(),
-                                Box::new(Expr::Const(neg_c, *w)),
-                            ));
-                        }
-                    }
-                    // Magic-number signed division pattern:
-                    // Sub(Sar(Shr(Mul(SignExt(x), magic), 32), shift), Sar(x, 31))
-                    // → SDiv(x, divisor)
-                    if let Some(div_expr) = try_fold_magic_sdiv(lhs, rhs) {
-                        return Some(div_expr);
-                    }
-                }
-                BinOp::Mul => {
-                    if matches!(rhs.as_ref(), Expr::Const(1, _)) {
-                        return Some(*lhs.clone());
-                    }
-                    if let Expr::Const(0, w) = rhs.as_ref() {
-                        return Some(Expr::Const(0, *w));
-                    }
-                }
-                BinOp::And => {
-                    if let Expr::Const(0, w) = rhs.as_ref() {
-                        return Some(Expr::Const(0, *w));
-                    }
-                    // And(x, 0xFF) → Trunc8(x), And(x, 0xFFFF) → Trunc16(x), etc.
-                    if let Expr::Const(mask, _) = rhs.as_ref() {
-                        let trunc_w = match *mask {
-                            0xFF => Some(BitWidth::Bit8),
-                            0xFFFF => Some(BitWidth::Bit16),
-                            0xFFFF_FFFF => Some(BitWidth::Bit32),
-                            _ => None,
-                        };
-                        if let Some(tw) = trunc_w {
-                            if lhs.width().bytes() > tw.bytes() {
-                                return Some(Expr::UnaryOp(UnaryOp::Trunc(tw), lhs.clone()));
-                            }
-                        }
-                    }
-                }
-                BinOp::Shr | BinOp::Sar => {
-                    // MSVC unsigned division pattern:
-                    // Shr(Mul(ZeroExt(x), magic), 32+shift) → UDiv(x, divisor)
-                    if matches!(op, BinOp::Shr) {
-                        if let Some(div_expr) = try_fold_magic_udiv(lhs, rhs) {
-                            return Some(div_expr);
-                        }
-                    }
-                    // Signed division by 2 pattern:
-                    // ((x >> 31) + x) >> 1  →  x / 2   (signed, rounds toward zero)
-                    // Also handles 64-bit: ((x >> 63) + x) >> 1
-                    // The inner >> can be Shr or Sar, the outer >> can be Shr or Sar.
-                    if matches!(rhs.as_ref(), Expr::Const(1, _)) {
-                        if let Expr::BinOp(BinOp::Add, a, b) = lhs.as_ref() {
-                            // Check both orderings: (shr(x,31) + x) and (x + shr(x,31))
-                            let matched = match (a.as_ref(), b.as_ref()) {
-                                (Expr::BinOp(shift_op, x1, shift), x2)
-                                    if matches!(shift_op, BinOp::Shr | BinOp::Sar)
-                                    && matches!(shift.as_ref(), Expr::Const(31, _) | Expr::Const(63, _))
-                                    && x1.as_ref() == x2 =>
-                                {
-                                    Some(x2)
-                                }
-                                (x2, Expr::BinOp(shift_op, x1, shift))
-                                    if matches!(shift_op, BinOp::Shr | BinOp::Sar)
-                                    && matches!(shift.as_ref(), Expr::Const(31, _) | Expr::Const(63, _))
-                                    && x1.as_ref() == x2 =>
-                                {
-                                    Some(x2)
-                                }
-                                _ => None,
-                            };
-                            if let Some(x) = matched {
-                                return Some(Expr::BinOp(
-                                    BinOp::SDiv,
-                                    Box::new(x.clone()),
-                                    Box::new(Expr::Const(2, x.width())),
-                                ));
-                            }
-                        }
-                    }
-                }
-                BinOp::Or => {
-                    if matches!(rhs.as_ref(), Expr::Const(0, _)) {
-                        return Some(*lhs.clone());
-                    }
-                }
-                _ => {}
-            }
-
-            None
-        }
-        Expr::UnaryOp(op, inner) => {
-            if let Expr::Const(val, w) = inner.as_ref() {
-                match op {
-                    UnaryOp::Neg => return Some(Expr::Const((!val).wrapping_add(1), *w)),
-                    UnaryOp::Not => return Some(Expr::Const(!val, *w)),
-                    UnaryOp::Trunc(tw) => {
-                        let mask = match tw {
-                            BitWidth::Bit8 => 0xFF,
-                            BitWidth::Bit16 => 0xFFFF,
-                            BitWidth::Bit32 => 0xFFFF_FFFF,
-                            BitWidth::Bit64 => u64::MAX,
-                        };
-                        return Some(Expr::Const(val & mask, *tw));
-                    }
-                    UnaryOp::ZeroExt(tw) => return Some(Expr::Const(*val, *tw)),
-                    UnaryOp::SignExt(tw) => {
-                        let sign_extended = match w {
-                            BitWidth::Bit8 => *val as i8 as i64 as u64,
-                            BitWidth::Bit16 => *val as i16 as i64 as u64,
-                            BitWidth::Bit32 => *val as i32 as i64 as u64,
-                            BitWidth::Bit64 => *val,
-                        };
-                        return Some(Expr::Const(sign_extended, *tw));
-                    }
-                    UnaryOp::AddrOf => {}
-                }
-            }
-            // Simplify nested casts
-            if let Expr::UnaryOp(inner_op, inner_inner) = inner.as_ref() {
-                match (op, inner_op) {
-                    (UnaryOp::SignExt(sw), UnaryOp::Trunc(tw)) if sw == tw => {
-                        return Some(Expr::UnaryOp(UnaryOp::SignExt(*sw), inner_inner.clone()));
-                    }
-                    (UnaryOp::ZeroExt(zw), UnaryOp::Trunc(tw)) if zw == tw => {
-                        return Some(Expr::UnaryOp(UnaryOp::ZeroExt(*zw), inner_inner.clone()));
-                    }
-                    (UnaryOp::Trunc(tw), UnaryOp::ZeroExt(_) | UnaryOp::SignExt(_)) => {
-                        if inner_inner.width().bytes() <= tw.bytes() {
-                            if inner_inner.width() == *tw {
-                                return Some(*inner_inner.clone());
-                            }
-                            return Some(Expr::UnaryOp(UnaryOp::Trunc(*tw), inner_inner.clone()));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Cast to same width is identity
-            match op {
-                UnaryOp::ZeroExt(w) | UnaryOp::SignExt(w) | UnaryOp::Trunc(w) => {
-                    if inner.width() == *w {
-                        return Some(*inner.clone());
-                    }
-                }
-                _ => {}
-            }
-            None
-        }
+        Expr::BinOp(op, lhs, rhs) => try_fold_binop(*op, lhs, rhs),
+        Expr::UnaryOp(op, inner) => try_fold_unaryop(*op, inner),
         _ => None,
     };
 
@@ -950,12 +727,221 @@ fn fold_expr(expr: &Expr) -> Option<Expr> {
     }
 }
 
+/// Try to fold a BinOp expression: constant evaluation + algebraic simplifications.
+fn try_fold_binop(op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    // Constant folding: both operands are constants
+    if let (Expr::Const(l, w), Expr::Const(r, _)) = (lhs, rhs) {
+        let result = match op {
+            BinOp::Add => Some(l.wrapping_add(*r)),
+            BinOp::Sub => Some(l.wrapping_sub(*r)),
+            BinOp::Mul => Some(l.wrapping_mul(*r)),
+            BinOp::And => Some(l & r),
+            BinOp::Or => Some(l | r),
+            BinOp::Xor => Some(l ^ r),
+            BinOp::Shl => Some(l.wrapping_shl(*r as u32)),
+            BinOp::Shr => Some(l.wrapping_shr(*r as u32)),
+            BinOp::Rol => Some(l.rotate_left(*r as u32)),
+            BinOp::Ror => Some(l.rotate_right(*r as u32)),
+            _ => None,
+        };
+        if let Some(val) = result {
+            return Some(Expr::Const(val, *w));
+        }
+    }
+
+    // Algebraic simplifications
+    match op {
+        BinOp::Add => {
+            if matches!(rhs, Expr::Const(0, _)) {
+                return Some(lhs.clone());
+            }
+            if matches!(lhs, Expr::Const(0, _)) {
+                return Some(rhs.clone());
+            }
+            if lhs == rhs {
+                return Some(Expr::BinOp(
+                    BinOp::Shl,
+                    Box::new(lhs.clone()),
+                    Box::new(Expr::Const(1, BitWidth::Bit8)),
+                ));
+            }
+        }
+        BinOp::Sub => {
+            if matches!(rhs, Expr::Const(0, _)) {
+                return Some(lhs.clone());
+            }
+            if matches!(lhs, Expr::Const(0, _)) {
+                return Some(Expr::UnaryOp(UnaryOp::Neg, Box::new(rhs.clone())));
+            }
+            // Sub(x, negative_const) �?Add(x, -negative_const)
+            if let Expr::Const(c, w) = rhs {
+                let is_neg = match w {
+                    BitWidth::Bit8 => *c > 0x7F && *c <= 0xFF,
+                    BitWidth::Bit16 => *c > 0x7FFF && *c <= 0xFFFF,
+                    BitWidth::Bit32 => *c > 0x7FFF_FFFF && *c <= 0xFFFF_FFFF,
+                    BitWidth::Bit64 => *c > 0x7FFF_FFFF_FFFF_FFFF,
+                };
+                if is_neg {
+                    let neg_c = match w {
+                        BitWidth::Bit8 => (!*c).wrapping_add(1) & 0xFF,
+                        BitWidth::Bit16 => (!*c).wrapping_add(1) & 0xFFFF,
+                        BitWidth::Bit32 => (!*c).wrapping_add(1) & 0xFFFF_FFFF,
+                        BitWidth::Bit64 => (!*c).wrapping_add(1),
+                    };
+                    return Some(Expr::BinOp(
+                        BinOp::Add,
+                        Box::new(lhs.clone()),
+                        Box::new(Expr::Const(neg_c, *w)),
+                    ));
+                }
+            }
+            // Magic-number signed division pattern
+            if let Some(div_expr) = try_fold_magic_sdiv(lhs, rhs) {
+                return Some(div_expr);
+            }
+        }
+        BinOp::Mul => {
+            if matches!(rhs, Expr::Const(1, _)) {
+                return Some(lhs.clone());
+            }
+            if let Expr::Const(0, w) = rhs {
+                return Some(Expr::Const(0, *w));
+            }
+        }
+        BinOp::And => {
+            if let Expr::Const(0, w) = rhs {
+                return Some(Expr::Const(0, *w));
+            }
+            // And(x, 0xFF) �?Trunc8(x), etc.
+            if let Expr::Const(mask, _) = rhs {
+                let trunc_w = match *mask {
+                    0xFF => Some(BitWidth::Bit8),
+                    0xFFFF => Some(BitWidth::Bit16),
+                    0xFFFF_FFFF => Some(BitWidth::Bit32),
+                    _ => None,
+                };
+                if let Some(tw) = trunc_w {
+                    if lhs.width().bytes() > tw.bytes() {
+                        return Some(Expr::UnaryOp(UnaryOp::Trunc(tw), Box::new(lhs.clone())));
+                    }
+                }
+            }
+        }
+        BinOp::Shr | BinOp::Sar => {
+            // MSVC unsigned division pattern
+            if matches!(op, BinOp::Shr) {
+                if let Some(div_expr) = try_fold_magic_udiv(lhs, rhs) {
+                    return Some(div_expr);
+                }
+            }
+            // Signed division by 2 pattern
+            if matches!(rhs, Expr::Const(1, _)) {
+                if let Expr::BinOp(BinOp::Add, a, b) = lhs {
+                    let matched = match (a.as_ref(), b.as_ref()) {
+                        (Expr::BinOp(shift_op, x1, shift), x2)
+                            if matches!(shift_op, BinOp::Shr | BinOp::Sar)
+                            && matches!(shift.as_ref(), Expr::Const(31, _) | Expr::Const(63, _))
+                            && x1.as_ref() == x2 =>
+                        {
+                            Some(x2)
+                        }
+                        (x2, Expr::BinOp(shift_op, x1, shift))
+                            if matches!(shift_op, BinOp::Shr | BinOp::Sar)
+                            && matches!(shift.as_ref(), Expr::Const(31, _) | Expr::Const(63, _))
+                            && x1.as_ref() == x2 =>
+                        {
+                            Some(x2)
+                        }
+                        _ => None,
+                    };
+                    if let Some(x) = matched {
+                        return Some(Expr::BinOp(
+                            BinOp::SDiv,
+                            Box::new(x.clone()),
+                            Box::new(Expr::Const(2, x.width())),
+                        ));
+                    }
+                }
+            }
+        }
+        BinOp::Or => {
+            if matches!(rhs, Expr::Const(0, _)) {
+                return Some(lhs.clone());
+            }
+        }
+        _ => {}
+    }
+
+    None
+}
+
+/// Try to fold a UnaryOp expression: constant evaluation + cast simplifications.
+fn try_fold_unaryop(op: UnaryOp, inner: &Expr) -> Option<Expr> {
+    // Constant folding
+    if let Expr::Const(val, w) = inner {
+        match op {
+            UnaryOp::Neg => return Some(Expr::Const((!val).wrapping_add(1), *w)),
+            UnaryOp::Not => return Some(Expr::Const(!val, *w)),
+            UnaryOp::Trunc(tw) => {
+                let mask = match tw {
+                    BitWidth::Bit8 => 0xFF,
+                    BitWidth::Bit16 => 0xFFFF,
+                    BitWidth::Bit32 => 0xFFFF_FFFF,
+                    BitWidth::Bit64 => u64::MAX,
+                };
+                return Some(Expr::Const(val & mask, tw));
+            }
+            UnaryOp::ZeroExt(tw) => return Some(Expr::Const(*val, tw)),
+            UnaryOp::SignExt(tw) => {
+                let sign_extended = match w {
+                    BitWidth::Bit8 => *val as i8 as i64 as u64,
+                    BitWidth::Bit16 => *val as i16 as i64 as u64,
+                    BitWidth::Bit32 => *val as i32 as i64 as u64,
+                    BitWidth::Bit64 => *val,
+                };
+                return Some(Expr::Const(sign_extended, tw));
+            }
+            UnaryOp::AddrOf => {}
+        }
+    }
+    // Simplify nested casts
+    if let Expr::UnaryOp(inner_op, inner_inner) = inner {
+        match (op, inner_op) {
+            (UnaryOp::SignExt(sw), UnaryOp::Trunc(tw)) if sw == *tw => {
+                return Some(Expr::UnaryOp(UnaryOp::SignExt(sw), inner_inner.clone()));
+            }
+            (UnaryOp::ZeroExt(zw), UnaryOp::Trunc(tw)) if zw == *tw => {
+                return Some(Expr::UnaryOp(UnaryOp::ZeroExt(zw), inner_inner.clone()));
+            }
+            (UnaryOp::Trunc(tw), UnaryOp::ZeroExt(_) | UnaryOp::SignExt(_)) => {
+                if inner_inner.width().bytes() <= tw.bytes() {
+                    if inner_inner.width() == tw {
+                        return Some(*inner_inner.clone());
+                    }
+                    return Some(Expr::UnaryOp(UnaryOp::Trunc(tw), inner_inner.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Cast to same width is identity
+    match op {
+        UnaryOp::ZeroExt(w) | UnaryOp::SignExt(w) | UnaryOp::Trunc(w) => {
+            if inner.width() == w {
+                return Some(inner.clone());
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// Recognize GCC/Clang magic-number signed division pattern.
 ///
 /// Pattern: `Sub(Sar(Shr(Mul(SignExt(x), magic), 32), shift), Sar(x, 31))`
 /// Folds to: `SDiv(x, divisor)` where divisor is derived from magic and shift.
 fn try_fold_magic_sdiv(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
-    // rhs must be Sar(x, 31) — sign correction
+    // rhs must be Sar(x, 31) �?sign correction
     let (sign_x, sign_shift) = match rhs {
         Expr::BinOp(BinOp::Sar, x, s) => (x.as_ref(), s.as_ref()),
         _ => return None,
@@ -1031,7 +1017,7 @@ fn magic_to_divisor(magic: u64, shift: u64) -> Option<u64> {
 
 /// Recognize MSVC unsigned division pattern.
 ///
-/// Pattern: `Shr(Mul(ZeroExt(x), magic), total_shift)` → `UDiv(x, divisor)`
+/// Pattern: `Shr(Mul(ZeroExt(x), magic), total_shift)` �?`UDiv(x, divisor)`
 /// Also: `Shr(Shr(Mul(ZeroExt(x), magic), 32), extra_shift)` (two-stage shift)
 fn try_fold_magic_udiv(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
     let Expr::Const(total_shift, _) = rhs else { return None };
@@ -1094,88 +1080,12 @@ fn copy_propagation(func: &mut Function) -> bool {
     let mut changed = false;
 
     for block in &mut func.blocks {
-        // Build a map of register copies: reg_name -> expr
-        // Phase 1: collect definitions (forward pass)
         let mut copies: HashMap<String, Expr> = HashMap::new();
-
-        for stmt in block.stmts.iter() {
-            if let Stmt::Assign(var, expr) = stmt {
-                let key = format!("{var}");
-                match var {
-                    Var::Reg(_, _) => {
-                        if expr_uses_var_key(expr, &key) {
-                            copies.remove(&key);
-                        } else {
-                            copies.insert(key.clone(), expr.clone());
-                        }
-                        let invalidated: Vec<String> = copies
-                            .iter()
-                            .filter(|(k, v)| *k != &key && expr_uses_var_key(v, &key))
-                            .map(|(k, _)| k.clone())
-                            .collect();
-                        for k in invalidated {
-                            copies.remove(&k);
-                        }
-                    }
-                    _ => {
-                        // For non-register vars, only propagate simple copies.
-                        // BUT don't propagate stack = register (parameter stores)
-                        // as that would replace var_N with rdi/rsi, undoing arg absorption.
-                        match expr {
-                            Expr::Var(Var::Reg(_, _)) => {
-                                // Don't add to copy map: var_18 = rdi should not
-                                // cause var_18 to be replaced with rdi elsewhere
-                            }
-                            Expr::Var(_) | Expr::Const(_, _) => {
-                                copies.insert(key.clone(), expr.clone());
-                            }
-                            _ => {
-                                copies.remove(&key);
-                            }
-                        }
-                        // Invalidate any copies whose RHS references
-                        // this variable (it was just reassigned).
-                        let invalidated: Vec<String> = copies
-                            .iter()
-                            .filter(|(k, v)| *k != &key && expr_uses_var_key(v, &key))
-                            .map(|(k, _)| k.clone())
-                            .collect();
-                        for k in invalidated {
-                            copies.remove(&k);
-                        }
-                        // Also invalidate copies whose RHS contains a Load
-                        // from the same stack offset (aliasing: Load(rbp-off) == var_off).
-                        if let Var::Stack(off, _) = var {
-                            let has_fp = func.has_frame_pointer;
-                            let invalidated2: Vec<String> = copies
-                                .iter()
-                                .filter(|(k, v)| *k != &key && expr_contains_stack_load(v, *off, has_fp))
-                                .map(|(k, _)| k.clone())
-                                .collect();
-                            for k in invalidated2 {
-                                copies.remove(&k);
-                            }
-                        }
-                    }
-                }
-            }
-            // Calls may clobber registers
-            if matches!(stmt, Stmt::Call(..)) {
-                copies.clear();
-            }
-            // Stores may invalidate copies whose values are memory loads
-            if matches!(stmt, Stmt::Store(..)) {
-                copies.retain(|_, v| !expr_contains_load(v));
-            }
-        }
-
-        // Phase 2: apply copies (forward pass)
-        let mut copies2: HashMap<String, Expr> = HashMap::new();
         for stmt in &mut block.stmts {
             // Apply current copies to this statement
             match stmt {
                 Stmt::Assign(var, expr) => {
-                    if propagate_copies(expr, &copies2) {
+                    if propagate_copies(expr, &copies) {
                         changed = true;
                     }
                     let key = format!("{var}");
@@ -1184,17 +1094,17 @@ fn copy_propagation(func: &mut Function) -> bool {
                             // Don't propagate self-referential definitions (e.g. rsp = rsp + 8)
                             // as they cause expression trees to grow unboundedly across iterations.
                             if expr_uses_var_key(expr, &key) {
-                                copies2.remove(&key);
+                                copies.remove(&key);
                             } else {
-                                copies2.insert(key.clone(), expr.clone());
+                                copies.insert(key.clone(), expr.clone());
                             }
-                            let invalidated: Vec<String> = copies2
+                            let invalidated: Vec<String> = copies
                                 .iter()
                                 .filter(|(k, v)| *k != &key && expr_uses_var_key(v, &key))
                                 .map(|(k, _)| k.clone())
                                 .collect();
                             for k in invalidated {
-                                copies2.remove(&k);
+                                copies.remove(&k);
                             }
                         }
                         _ => {
@@ -1203,50 +1113,50 @@ fn copy_propagation(func: &mut Function) -> bool {
                                     // Don't propagate stack = register
                                 }
                                 Expr::Var(_) | Expr::Const(_, _) => {
-                                    copies2.insert(key.clone(), expr.clone());
+                                    copies.insert(key.clone(), expr.clone());
                                 }
                                 _ => {
-                                    copies2.remove(&key);
+                                    copies.remove(&key);
                                 }
                             }
                             // Invalidate any copies whose RHS references
                             // this variable (it was just reassigned).
-                            let invalidated: Vec<String> = copies2
+                            let invalidated: Vec<String> = copies
                                 .iter()
                                 .filter(|(k, v)| *k != &key && expr_uses_var_key(v, &key))
                                 .map(|(k, _)| k.clone())
                                 .collect();
                             for k in invalidated {
-                                copies2.remove(&k);
+                                copies.remove(&k);
                             }
                             // Also invalidate copies whose RHS contains a Load
                             // from the same stack offset (aliasing: Load(rbp-off) == var_off).
                             if let Var::Stack(off, _) = var {
                                 let has_fp = func.has_frame_pointer;
-                                let invalidated2: Vec<String> = copies2
+                                let invalidated2: Vec<String> = copies
                                     .iter()
                                     .filter(|(k, v)| *k != &key && expr_contains_stack_load(v, *off, has_fp))
                                     .map(|(k, _)| k.clone())
                                     .collect();
                                 for k in invalidated2 {
-                                    copies2.remove(&k);
+                                    copies.remove(&k);
                                 }
                             }
                         }
                     }
                 }
                 Stmt::Store(addr, val, _) => {
-                    changed |= propagate_copies(addr, &copies2);
-                    changed |= propagate_copies(val, &copies2);
+                    changed |= propagate_copies(addr, &copies);
+                    changed |= propagate_copies(val, &copies);
                     // Stores may invalidate copies whose values are memory loads
-                    copies2.retain(|_, v| !expr_contains_load(v));
+                    copies.retain(|_, v| !expr_contains_load(v));
                 }
                 Stmt::Call(_, target, args) => {
-                    changed |= propagate_copies(target, &copies2);
+                    changed |= propagate_copies(target, &copies);
                     for arg in args.iter_mut() {
-                        changed |= propagate_copies(arg, &copies2);
+                        changed |= propagate_copies(arg, &copies);
                     }
-                    copies2.clear(); // calls clobber registers
+                    copies.clear(); // calls clobber registers
                 }
                 Stmt::Nop => {}
             }
@@ -1255,16 +1165,16 @@ fn copy_propagation(func: &mut Function) -> bool {
         // Propagate into terminator
         match &mut block.terminator {
             Terminator::Branch(cond, _, _) => {
-                changed |= propagate_copies(cond, &copies2);
+                changed |= propagate_copies(cond, &copies);
             }
             Terminator::Return(Some(val)) => {
-                changed |= propagate_copies(val, &copies2);
+                changed |= propagate_copies(val, &copies);
             }
             Terminator::IndirectJump(target) => {
-                changed |= propagate_copies(target, &copies2);
+                changed |= propagate_copies(target, &copies);
             }
             Terminator::Switch(val, _, _) => {
-                changed |= propagate_copies(val, &copies2);
+                changed |= propagate_copies(val, &copies);
             }
             _ => {}
         }
@@ -1275,17 +1185,7 @@ fn copy_propagation(func: &mut Function) -> bool {
 
 /// Check if an expression references a variable by its string key.
 fn expr_uses_var_key(expr: &Expr, key: &str) -> bool {
-    match expr {
-        Expr::Var(v) => format!("{v}") == key,
-        Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r) => {
-            expr_uses_var_key(l, key) || expr_uses_var_key(r, key)
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => expr_uses_var_key(inner, key),
-        Expr::Select(c, t, f) => {
-            expr_uses_var_key(c, key) || expr_uses_var_key(t, key) || expr_uses_var_key(f, key)
-        }
-        _ => false,
-    }
+    expr.any(&|e| matches!(e, Expr::Var(v) if format!("{v}") == key))
 }
 
 /// Check if an expression contains a Load from a specific stack offset.
@@ -1663,7 +1563,7 @@ fn replace_stack_loads(expr: &mut Expr, has_fp: bool, frame_size: u64) -> bool {
                 return true;
             }
             // Even if this Load isn't a direct stack access, recurse into its
-            // address sub-expression (e.g. *(u32*)*(u64*)(rbp + off) — the
+            // address sub-expression (e.g. *(u32*)*(u64*)(rbp + off) �?the
             // inner Load(rbp+off) should still become var_N).
             replace_stack_loads(addr, has_fp, frame_size)
         }
@@ -1743,7 +1643,7 @@ fn expression_inlining(func: &mut Function) -> bool {
                             )
                         });
                         if has_intervening {
-                            continue; // skip this inlining — unsafe
+                            continue; // skip this inlining �?unsafe
                         }
                     }
                 }
@@ -1826,7 +1726,7 @@ fn cross_block_temp_inlining(func: &mut Function) -> bool {
         }
 
         // Skip if expr contains a Load and there might be intervening side effects
-        // across block boundaries — too complex to verify safety.
+        // across block boundaries �?too complex to verify safety.
         if expr_contains_load(expr) {
             continue;
         }
@@ -1876,7 +1776,7 @@ fn cross_block_temp_inlining(func: &mut Function) -> bool {
                         stmt_may_clobber_expr(&func.blocks[*def_bi].stmts[i], expr)
                     });
                     if has_intervening {
-                        // Undo — re-insert the var
+                        // Undo �?re-insert the var
                         // Actually we already mutated...skip this case
                         continue;
                     }
@@ -1986,25 +1886,11 @@ fn count_temp_uses_in_terminator(term: &Terminator, counts: &mut HashMap<String,
 }
 
 fn count_temp_uses_in_expr(expr: &Expr, counts: &mut HashMap<String, usize>) {
-    match expr {
-        Expr::Var(v @ Var::Temp(_, _)) => {
+    expr.walk(&mut |e| {
+        if let Expr::Var(v @ Var::Temp(_, _)) = e {
             *counts.entry(format!("{v}")).or_insert(0) += 1;
         }
-        Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
-        | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
-            count_temp_uses_in_expr(l, counts);
-            count_temp_uses_in_expr(r, counts);
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            count_temp_uses_in_expr(inner, counts);
-        }
-        Expr::Select(c, t, f) => {
-            count_temp_uses_in_expr(c, counts);
-            count_temp_uses_in_expr(t, counts);
-            count_temp_uses_in_expr(f, counts);
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Check if an expression contains a Call or Store (shouldn't be in expr trees, but guard).
@@ -2012,7 +1898,7 @@ fn expr_contains_call_or_store(_expr: &Expr) -> bool {
     false // Exprs don't contain calls/stores; they're in Stmt
 }
 
-/// Check if an expression is "stable" across block boundaries — i.e., its
+/// Check if an expression is "stable" across block boundaries �?i.e., its
 /// sub-expressions won't be modified by intervening statements in other blocks.
 /// Conservative: only allow Var (args, stack vars, temps), Const, and simple ops on them.
 fn expr_is_stable_across_blocks(expr: &Expr) -> bool {
@@ -2037,7 +1923,7 @@ fn stmt_may_clobber_expr(stmt: &Stmt, expr: &Expr) -> bool {
         Stmt::Store(..) => expr_contains_load(expr),
         Stmt::Assign(var, _) => {
             let key = format!("{var}");
-            expr_mentions_var(expr, &key)
+            expr_uses_var_key(expr, &key)
         }
         Stmt::Nop => false,
     }
@@ -2045,44 +1931,18 @@ fn stmt_may_clobber_expr(stmt: &Stmt, expr: &Expr) -> bool {
 
 /// Check if an expression contains a Load (memory read).
 fn expr_contains_load(expr: &Expr) -> bool {
-    match expr {
-        Expr::Load(_, _) => true,
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs)
-        | Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
-            expr_contains_load(lhs) || expr_contains_load(rhs)
-        }
-        Expr::UnaryOp(_, inner) => expr_contains_load(inner),
-        Expr::Select(c, t, f) => {
-            expr_contains_load(c) || expr_contains_load(t) || expr_contains_load(f)
-        }
-        _ => false,
-    }
+    expr.any(&|e| matches!(e, Expr::Load(..)))
 }
 
 /// Check if a statement references a variable by key string (in its RHS).
 fn stmt_mentions_var(stmt: &Stmt, key: &str) -> bool {
     match stmt {
-        Stmt::Assign(_, expr) => expr_mentions_var(expr, key),
-        Stmt::Store(addr, val, _) => expr_mentions_var(addr, key) || expr_mentions_var(val, key),
+        Stmt::Assign(_, expr) => expr_uses_var_key(expr, key),
+        Stmt::Store(addr, val, _) => expr_uses_var_key(addr, key) || expr_uses_var_key(val, key),
         Stmt::Call(_, target, args) => {
-            expr_mentions_var(target, key) || args.iter().any(|a| expr_mentions_var(a, key))
+            expr_uses_var_key(target, key) || args.iter().any(|a| expr_uses_var_key(a, key))
         }
         Stmt::Nop => false,
-    }
-}
-
-fn expr_mentions_var(expr: &Expr, key: &str) -> bool {
-    match expr {
-        Expr::Var(v) => format!("{v}") == key,
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs)
-        | Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
-            expr_mentions_var(lhs, key) || expr_mentions_var(rhs, key)
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => expr_mentions_var(inner, key),
-        Expr::Select(c, t, f) => {
-            expr_mentions_var(c, key) || expr_mentions_var(t, key) || expr_mentions_var(f, key)
-        }
-        _ => false,
     }
 }
 
@@ -2113,25 +1973,11 @@ fn count_var_uses_terminator(term: &Terminator, counts: &mut HashMap<String, usi
 }
 
 fn count_expr_uses(expr: &Expr, counts: &mut HashMap<String, usize>) {
-    match expr {
-        Expr::Var(v) => {
+    expr.walk(&mut |e| {
+        if let Expr::Var(v) = e {
             *counts.entry(format!("{v}")).or_insert(0) += 1;
         }
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs)
-        | Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
-            count_expr_uses(lhs, counts);
-            count_expr_uses(rhs, counts);
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            count_expr_uses(inner, counts);
-        }
-        Expr::Select(c, t, f) => {
-            count_expr_uses(c, counts);
-            count_expr_uses(t, counts);
-            count_expr_uses(f, counts);
-        }
-        _ => {}
-    }
+    });
 }
 
 fn inline_var_in_stmt(stmt: &mut Stmt, key: &str, replacement: &Expr) -> bool {
@@ -2163,27 +2009,16 @@ fn inline_var_in_terminator(term: &mut Terminator, key: &str, replacement: &Expr
 }
 
 fn inline_var_in_expr(expr: &mut Expr, key: &str, replacement: &Expr) -> bool {
-    match expr {
-        Expr::Var(v) if format!("{v}") == key => {
-            *expr = replacement.clone();
-            true
+    let mut changed = false;
+    expr.walk_mut(&mut |e| {
+        if let Expr::Var(v) = e {
+            if format!("{v}") == key {
+                *e = replacement.clone();
+                changed = true;
+            }
         }
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs) => {
-            let a = inline_var_in_expr(lhs, key, replacement);
-            let b = inline_var_in_expr(rhs, key, replacement);
-            a | b
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            inline_var_in_expr(inner, key, replacement)
-        }
-        Expr::Select(c, t, f) => {
-            let a = inline_var_in_expr(c, key, replacement);
-            let b = inline_var_in_expr(t, key, replacement);
-            let d = inline_var_in_expr(f, key, replacement);
-            a || b || d
-        }
-        _ => false,
-    }
+    });
+    changed
 }
 
 // ── Call result propagation ──────────────────────────────────────
@@ -2296,7 +2131,7 @@ fn propagate_call_results(func: &mut Function) -> bool {
         // Replace Var::Reg(Rax, _) with temp in successor's stmts and terminator,
         // and continue transitively through the CFG until rax is redefined.
         // SAFETY: don't propagate into a block if any of its CFG predecessors
-        // (not just ones we've visited) redefine rax — that means the block
+        // (not just ones we've visited) redefine rax �?that means the block
         // is a merge point where rax may carry a different value (e.g. loop
         // back-edge with rax incremented). Instead, insert `rax = temp` at
         // the end of the predecessor block(s) that reach the merge point.
@@ -2312,7 +2147,7 @@ fn propagate_call_results(func: &mut Function) -> bool {
             let has_rax_redef_pred = pred_map[bi].iter()
                 .any(|&pi| pi != pred_idx && rax_redefined_in.contains(&pi));
             if has_rax_redef_pred {
-                // This is a merge point — find which visited predecessors
+                // This is a merge point �?find which visited predecessors
                 // should get `rax = temp` inserted before entering this block.
                 for &pi in &pred_map[bi] {
                     if visited.contains(&pi) || pi == pred_idx {
@@ -2358,7 +2193,7 @@ fn replace_reg_in_stmt(stmt: &mut Stmt, reg: RegId, replacement: &Expr) {
     match stmt {
         Stmt::Assign(_var, expr) => {
             replace_reg_in_expr(expr, reg, replacement);
-            // If LHS is the same reg, this is a new definition — handled elsewhere
+            // If LHS is the same reg, this is a new definition �?handled elsewhere
         }
         Stmt::Store(addr, val, _) => {
             replace_reg_in_expr(addr, reg, replacement);
@@ -2385,24 +2220,11 @@ fn replace_reg_in_terminator(term: &mut Terminator, reg: RegId, replacement: &Ex
 }
 
 fn replace_reg_in_expr(expr: &mut Expr, reg: RegId, replacement: &Expr) {
-    match expr {
-        Expr::Var(Var::Reg(r, _)) if *r == reg => {
-            *expr = replacement.clone();
+    expr.walk_mut(&mut |e| {
+        if matches!(e, Expr::Var(Var::Reg(r, _)) if *r == reg) {
+            *e = replacement.clone();
         }
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs) => {
-            replace_reg_in_expr(lhs, reg, replacement);
-            replace_reg_in_expr(rhs, reg, replacement);
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            replace_reg_in_expr(inner, reg, replacement);
-        }
-        Expr::Select(cond, true_val, false_val) => {
-            replace_reg_in_expr(cond, reg, replacement);
-            replace_reg_in_expr(true_val, reg, replacement);
-            replace_reg_in_expr(false_val, reg, replacement);
-        }
-        _ => {}
-    }
+    });
 }
 
 // ── Dead store elimination ───────────────────────────────────────
@@ -2421,7 +2243,7 @@ fn local_dead_store_elimination(func: &mut Function) -> bool {
         // Forward scan: track pending assignments that haven't been read yet.
         // If a register/stack-var is assigned again before being read,
         // the previous assignment is dead.
-        let mut pending: HashMap<String, usize> = HashMap::new(); // key → stmt index
+        let mut pending: HashMap<String, usize> = HashMap::new(); // key �?stmt index
         let mut to_nop: Vec<usize> = Vec::new();
 
         for i in 0..block.stmts.len() {
@@ -2462,7 +2284,7 @@ fn local_dead_store_elimination(func: &mut Function) -> bool {
                     for k in &invalidated {
                         pending.remove(k);
                     }
-                    // Same key → previous is dead
+                    // Same key �?previous is dead
                     if let Some(prev_idx) = pending.get(&key) {
                         to_nop.push(*prev_idx);
                     }
@@ -2483,7 +2305,7 @@ fn local_dead_store_elimination(func: &mut Function) -> bool {
                             to_nop.push(prev_idx);
                         }
                     }
-                    // Calls with address-of args may read stack vars — mark them live
+                    // Calls with address-of args may read stack vars �?mark them live
                     for arg in args {
                         if let Expr::UnaryOp(UnaryOp::AddrOf, inner) = arg {
                             if let Expr::Var(Var::Stack(_, _)) = inner.as_ref() {
@@ -2622,25 +2444,11 @@ fn collect_rhs_uses(stmt: &Stmt, uses: &mut HashSet<String>) {
 }
 
 fn collect_expr_uses(expr: &Expr, uses: &mut HashSet<String>) {
-    match expr {
-        Expr::Var(v) => {
+    expr.walk(&mut |e| {
+        if let Expr::Var(v) = e {
             uses.insert(format!("{v}"));
         }
-        Expr::BinOp(_, lhs, rhs) | Expr::Cmp(_, lhs, rhs)
-        | Expr::LogicalAnd(lhs, rhs) | Expr::LogicalOr(lhs, rhs) => {
-            collect_expr_uses(lhs, uses);
-            collect_expr_uses(rhs, uses);
-        }
-        Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-            collect_expr_uses(inner, uses);
-        }
-        Expr::Select(c, t, f) => {
-            collect_expr_uses(c, uses);
-            collect_expr_uses(t, uses);
-            collect_expr_uses(f, uses);
-        }
-        _ => {}
-    }
+    });
 }
 
 // ── Call optimization ────────────────────────────────────────────
@@ -2955,10 +2763,10 @@ fn trim_call_args(func: &mut Function, callee_param_counts: &HashMap<u64, usize>
 
             // Heuristic: trim trailing identity-passthrough args.
             // An arg at position i that equals param_regs[i] is an identity
-            // passthrough (register was never modified — likely ABI noise).
-            // A param reg at a DIFFERENT position indicates explicit setup — stop.
+            // passthrough (register was never modified �?likely ABI noise).
+            // A param reg at a DIFFERENT position indicates explicit setup �?stop.
             // NEW: if the register was read earlier in the block, it carries a
-            // real value (e.g. forwarded function parameter) — keep it.
+            // real value (e.g. forwarded function parameter) �?keep it.
             while !args.is_empty() {
                 let idx = args.len() - 1;
                 let last = args.last().unwrap();
@@ -2966,16 +2774,16 @@ fn trim_call_args(func: &mut Function, callee_param_counts: &HashMap<u64, usize>
                     if param_regs_vec.get(idx).map_or(false, |pr| pr == r) {
                         // Identity passthrough at natural position
                         if regs_read_before.contains(r) {
-                            // Register was read before the call — it's a real value
+                            // Register was read before the call �?it's a real value
                             break;
                         }
                         args.pop();
                         changed = true;
                     } else if param_regs_set.contains(r) {
-                        // Shuffled param reg at wrong position — keep
+                        // Shuffled param reg at wrong position �?keep
                         break;
                     } else {
-                        // Non-param register — keep
+                        // Non-param register �?keep
                         break;
                     }
                 } else {
@@ -3108,19 +2916,7 @@ fn terminator_reads(term: &Terminator, var: &Var) -> bool {
 
 /// Recursively check if an expression references a variable.
 fn expr_contains_var(expr: &Expr, var: &Var) -> bool {
-    match expr {
-        Expr::Var(v) => v == var,
-        Expr::Const(..) | Expr::Cond(_) => false,
-        Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
-        | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
-            expr_contains_var(l, var) || expr_contains_var(r, var)
-        }
-        Expr::UnaryOp(_, inner) => expr_contains_var(inner, var),
-        Expr::Load(addr, _) => expr_contains_var(addr, var),
-        Expr::Select(c, t, f) => {
-            expr_contains_var(c, var) || expr_contains_var(t, var) || expr_contains_var(f, var)
-        }
-    }
+    expr.any(&|e| matches!(e, Expr::Var(v) if v == var))
 }
 
 // ── Self-assignment elimination ──────────────────────────────────
@@ -3239,7 +3035,7 @@ fn promote_callee_saved_to_locals(func: &mut Function) {
     let callee_saved = func.calling_conv.callee_saved().to_vec();
 
     for &reg in &callee_saved {
-        // rbp is the frame pointer — skip it if the function uses a frame pointer
+        // rbp is the frame pointer �?skip it if the function uses a frame pointer
         if reg == RegId::Rbp && func.has_frame_pointer {
             continue;
         }
@@ -3319,7 +3115,7 @@ fn promote_all_regs_to_locals(func: &mut Function) {
         }
     }
 
-    // Remove rsp/rbp — never promote
+    // Remove rsp/rbp �?never promote
     defined_regs.remove(&RegId::Rsp);
     defined_regs.remove(&RegId::Rbp);
 
@@ -3340,32 +3136,18 @@ fn promote_all_regs_to_locals(func: &mut Function) {
             written: &HashSet<RegId>,
             out: &mut HashSet<RegId>,
         ) {
-            match expr {
-                Expr::Var(Var::Reg(r, _)) => {
+            expr.walk(&mut |e| {
+                if let Expr::Var(Var::Reg(r, _)) = e {
                     if param_regs.contains(r) && !written.contains(r) {
                         out.insert(*r);
                     }
                 }
-                Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r)
-                | Expr::LogicalAnd(l, r) | Expr::LogicalOr(l, r) => {
-                    collect_expr_reg_reads(l, param_regs, written, out);
-                    collect_expr_reg_reads(r, param_regs, written, out);
-                }
-                Expr::UnaryOp(_, inner) | Expr::Load(inner, _) => {
-                    collect_expr_reg_reads(inner, param_regs, written, out);
-                }
-                Expr::Select(c, t, f) => {
-                    collect_expr_reg_reads(c, param_regs, written, out);
-                    collect_expr_reg_reads(t, param_regs, written, out);
-                    collect_expr_reg_reads(f, param_regs, written, out);
-                }
-                _ => {}
-            }
+            });
         }
 
         // Walk ALL blocks in order to find parameter registers that are
         // read before being written.  Some leaf functions (e.g. reverse_bits)
-        // don't touch param regs in the entry block at all — they first
+        // don't touch param regs in the entry block at all �?they first
         // appear in a loop body.  We track writes globally so that a write
         // in an earlier block prevents later reads from being counted.
         for block_idx in block_indices_by_addr(func) {
@@ -3481,7 +3263,7 @@ fn expr_uses_reg(expr: &Expr, reg: RegId) -> bool {
 /// This must run before `simplify_void_returns` so that the values
 /// are visible in the returning block.
 fn fold_return_values(func: &mut Function) {
-    // Find blocks that return bare `rax` — these are return relays.
+    // Find blocks that return bare `rax` �?these are return relays.
     let return_relay_ids: HashSet<BlockId> = func.blocks.iter()
         .filter(|b| {
             matches!(
@@ -3622,7 +3404,7 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<Var>) {
 /// `Assign(Var::Temp(id), expr)`, inline the expression into the return and
 /// remove the now-dead assignment.
 ///
-/// Also handles Jump → relay patterns (same as Branch but with Jump terminators).
+/// Also handles Jump �?relay patterns (same as Branch but with Jump terminators).
 fn fold_temp_returns(func: &mut Function) {
     // Pass 1: Same-block inline
     for block in &mut func.blocks {
@@ -3653,7 +3435,7 @@ fn fold_temp_returns(func: &mut Function) {
         }
     }
 
-    // Pass 2: Jump → relay pattern.  If a block assigns Temp(id) then
+    // Pass 2: Jump �?relay pattern.  If a block assigns Temp(id) then
     // Jumps to a relay block `Return(Temp(id))` with no stmts, fold.
     let relay_info: Vec<(BlockId, u32)> = func.blocks.iter()
         .filter_map(|b| {
@@ -3704,8 +3486,8 @@ fn fold_temp_returns(func: &mut Function) {
 fn simplify_void_returns(func: &mut Function) {
     // Check if the function intentionally computes a return value in rax.
     // Exclude:
-    //   - `rax = 0` — this is `xor eax, eax` ABI noise before variadic calls
-    //   - `Call(Some(rax), _, _)` — call results land in rax by ABI convention,
+    //   - `rax = 0` �?this is `xor eax, eax` ABI noise before variadic calls
+    //   - `Call(Some(rax), _, _)` �?call results land in rax by ABI convention,
     //     not because the caller wants to return them
     // Only real rax defs (non-zero constants, computed expressions) block void
     // simplification.  If those got constant-folded into the Return terminator

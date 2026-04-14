@@ -32,7 +32,8 @@ fn has_raw_registers(output: &str) -> bool {
     ];
 
     output.lines().any(|line| {
-        line.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        let code = line.split_once("//").map_or(line, |(head, _)| head);
+        code.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
             .any(|token| REGS.contains(&token))
     })
 }
@@ -45,9 +46,12 @@ fn has_raw_registers(output: &str) -> bool {
 fn case7_fibonacci_recursive() {
     let binary = common::load_wsl_binary("case7_complex");
     let output = common::decompile_function(&binary, "fibonacci");
-    assert!(output.contains("fibonacci"), "should have recursive call");
-    assert!(output.contains("if"), "should have base case condition");
-    assert!(output.contains("return"), "should have returns");
+    assert!(output.contains("uint64_t fibonacci(int32_t arg_1)"), "should preserve signature, got:\n{output}");
+    assert!(output.contains("fibonacci((arg_1 - 1))"), "should contain first recursive call, got:\n{output}");
+    assert!(output.contains("fibonacci((arg_1 - 2))"), "should contain second recursive call, got:\n{output}");
+    assert!(output.contains("return 1;"), "should preserve base case for 1, got:\n{output}");
+    assert!(output.contains("return 0;"), "should preserve base case for 0, got:\n{output}");
+    assert!(!output.contains("goto"), "recursive output should stay structured, got:\n{output}");
 }
 
 #[test]
@@ -84,6 +88,8 @@ fn case7_bubble_sort_nested_loops() {
     let output = common::decompile_function(&binary, "bubble_sort");
     let loop_kw = output.matches("while").count() + output.matches("for").count();
     assert!(loop_kw >= 2, "bubble_sort should have >=2 loops, got {loop_kw}");
+    assert!(output.contains("do {") || output.contains("while ("), "bubble_sort should preserve loop structure, got:\n{output}");
+    assert!(output.contains("return"), "bubble_sort should return a value, got:\n{output}");
 }
 
 #[test]
@@ -92,6 +98,8 @@ fn case7_binary_search_decompiles() {
     let output = common::decompile_function(&binary, "binary_search");
     let has_loop = output.contains("while") || output.contains("for");
     assert!(has_loop, "binary_search should have a loop");
+    assert!(output.contains("arg_3"), "binary_search should preserve target parameter, got:\n{output}");
+    assert!(output.contains("return -1") || output.contains("return 0xffffffff"), "binary_search should preserve not-found sentinel, got:\n{output}");
 }
 
 #[test]
@@ -99,7 +107,9 @@ fn case7_complex_condition_decompiles() {
     let binary = common::load_wsl_binary("case7_complex");
     let output = common::decompile_function(&binary, "complex_condition");
     assert!(output.contains("if"), "should have conditionals");
-    assert!(output.contains("return"), "should have returns");
+    assert!(output.contains("&&") || output.contains("||"), "should keep compound boolean logic, got:\n{output}");
+    assert!(output.contains("return 0;"), "should preserve zero-result path, got:\n{output}");
+    assert!(output.contains("return 1;") || output.contains("return 2;"), "should preserve non-zero result paths, got:\n{output}");
 }
 
 #[test]
@@ -165,6 +175,7 @@ fn case8_find_saddle_point_nested() {
         !has_raw_registers(&output),
         "find_saddle_point should not leak raw registers, got:\n{output}"
     );
+    assert!(!output.contains("goto"), "find_saddle_point should remain structured, got:\n{output}");
 }
 
 #[test]
@@ -188,6 +199,11 @@ fn case9_kmp_search_decompiles() {
         !output.contains("&arg_0"),
         "kmp_search should not anchor local stack buffers at arg_0, got:\n{output}"
     );
+    assert!(output.contains("compute_prefix("), "kmp_search should call compute_prefix, got:\n{output}");
+    assert!(
+        output.contains("t4 = -1;") || output.contains("return -1") || output.contains("return 0xffffffffffffffff"),
+        "kmp_search should preserve not-found sentinel path, got:\n{output}"
+    );
 }
 
 #[test]
@@ -209,6 +225,7 @@ fn case9_compute_prefix_resolves_block_gotos() {
         output.contains("while") || output.contains("for"),
         "compute_prefix should preserve loop structure, got:\n{output}"
     );
+    assert!(!has_raw_registers(&output), "compute_prefix should not leak raw registers, got:\n{output}");
 }
 
 #[test]
@@ -270,6 +287,7 @@ fn case10_rect_area_decompiles() {
         output.contains("*") || output.contains("->"),
         "should access struct fields"
     );
+    assert!(output.contains("abs("), "rect_area should preserve absolute-difference simplification, got:\n{output}");
 }
 
 #[test]
@@ -286,6 +304,7 @@ fn case10_dot_product_decompiles() {
         !has_raw_registers(&output),
         "dot_product should not leak raw registers, got:\n{output}"
     );
+    assert!(output.contains("while") || output.contains("do {"), "dot_product should keep loop structure, got:\n{output}");
 }
 
 #[test]

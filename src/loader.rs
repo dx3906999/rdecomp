@@ -54,7 +54,8 @@ pub struct Binary {
 impl Binary {
     /// Load a binary from file path.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path)?;
+        let canonical_path = std::fs::canonicalize(path)?;
+        let data = std::fs::read(canonical_path)?;
         Self::from_bytes(&data)
     }
 
@@ -312,9 +313,9 @@ impl Binary {
             return None;
         }
         let bytes = &remaining[..end];
-        // Only accept printable ASCII strings
-        if bytes.iter().all(|&b| b == b'\t' || b == b'\n' || (0x20..0x7f).contains(&b)) {
-            Some(String::from_utf8_lossy(bytes).into_owned())
+        let s = std::str::from_utf8(bytes).ok()?;
+        if s.chars().all(|ch| ch == '\t' || ch == '\n' || !ch.is_control()) {
+            Some(s.to_owned())
         } else {
             None
         }
