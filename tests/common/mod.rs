@@ -29,6 +29,60 @@ pub fn load_wsl_binary(name: &str) -> Binary {
     binary
 }
 
+/// Load a test binary from `test_file/bin/win/`.
+pub fn load_win_binary(name: &str) -> Binary {
+    let path = Path::new("test_file/bin/win").join(format!("{name}.exe"));
+    assert!(path.exists(), "test binary not found: {}", path.display());
+    let mut binary = Binary::from_path(&path).expect("failed to load binary");
+    binary.discover_functions();
+    binary
+}
+
+/// Load a test binary at a specific optimization level.
+/// `platform` is "wsl" or "win", `opt` is "O1", "O2", or "O3".
+pub fn load_opt_binary(platform: &str, opt: &str, name: &str) -> Binary {
+    let path = match platform {
+        "wsl" => Path::new("test_file/bin/wsl_opt").join(opt).join(name),
+        "win" => Path::new("test_file/bin/win_opt").join(opt).join(format!("{name}.exe")),
+        _ => panic!("unknown platform: {platform}"),
+    };
+    assert!(path.exists(), "test binary not found: {}", path.display());
+    let mut binary = Binary::from_path(&path).expect("failed to load binary");
+    binary.discover_functions();
+    binary
+}
+
+/// Try to decompile a function, returning Ok(output) or Err(message).
+pub fn try_decompile_function(binary: &Binary, func_name: &str) -> Result<String, String> {
+    let func_sym = binary
+        .functions
+        .iter()
+        .find(|f| f.name == func_name)
+        .ok_or_else(|| format!("function '{}' not found in binary", func_name))?;
+
+    let addr = func_sym.addr;
+    let size = infer_function_size(binary, func_sym);
+
+    let disasm: Box<dyn ArchDisasm> = Box::new(X86Disasm);
+    let instructions = disasm
+        .disassemble_function(binary, addr, size)
+        .map_err(|e| format!("disassembly failed: {e}"))?;
+
+    let cfg = Cfg::build(&instructions);
+
+    let mut lifter: Box<dyn ArchLifter> = Box::new(X86Lifter::new(binary.arch));
+    apply_calling_conv(binary, &mut *lifter);
+
+    let mut func = lifter.lift_function(&func_sym.name, addr, &cfg, binary);
+
+    let ctx = build_pass_context(binary);
+    let pm = analysis::default_pass_manager();
+    pm.run_all(&mut func, &ctx);
+
+    let mut codegen = CodeGenerator::new(&binary.functions, binary, false);
+    Ok(codegen.generate(&mut func, &cfg))
+}
+
 /// Full pipeline: disasm → cfg → lift → optimize → codegen for a single function.
 pub fn decompile_function(binary: &Binary, func_name: &str) -> String {
     let func_sym = binary

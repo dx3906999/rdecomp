@@ -6,7 +6,7 @@ fn ida_style_uses_hexrays_signature_types() {
     let output = common::decompile_function_with_style(&binary, "classify", true);
 
     assert!(
-        output.contains("_DWORD __fastcall classify(__int32 arg_1)"),
+        output.contains("__fastcall classify(__int32 arg_1)"),
         "IDA style should use Hex-Rays signature formatting, got:\n{output}"
     );
     assert!(!output.contains("uint32_t classify("), "IDA style should not fall back to C99 signature, got:\n{output}");

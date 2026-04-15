@@ -155,13 +155,31 @@ src/
 └── typing.rs             # Type recovery / typing
 
 tests/
-├── case_basic.rs
-├── case_complex.rs
-├── cfg_tests.rs
-├── ida_style.rs
-├── interprocedural.rs
-├── ir_structure.rs
-└── loader.rs
+├── common/              # Shared test helpers
+│   └── mod.rs
+├── case_basic.rs         # Structural tests for cases 1–6
+├── case_complex.rs       # Structural tests for cases 7–10
+├── cfg_tests.rs          # CFG construction tests
+├── ida_style.rs          # IDA Hex-Rays style output tests
+├── interprocedural.rs    # Cross-function analysis tests
+├── ir_structure.rs       # IR lifting structure tests
+├── loader.rs             # Binary loader tests
+└── opt_matrix.rs         # Cross-platform × optimization level smoke tests
+
+test_file/
+├── cases/               # C source files (10 cases + test_project)
+├── bin/
+│   ├── wsl/             # ELF binaries (default)
+│   ├── win/             # PE binaries (default)
+│   ├── wsl_opt/         # ELF binaries at O1/O2/O3
+│   │   ├── O1/
+│   │   ├── O2/
+│   │   └── O3/
+│   └── win_opt/         # PE binaries at O1/O2/O3
+│       ├── O1/
+│       ├── O2/
+│       └── O3/
+└── results/             # Decompilation output snapshots
 ```
 
 ---
@@ -341,33 +359,34 @@ Best for users who prefer a Hex-Rays-like presentation style.
 
 ## Testing / 测试
 
-Run the test suite with:
+Run the full test suite:
 
 ```bash
 cargo test
 ```
 
-### English
+### Test Coverage / 测试覆盖
 
-The existing tests cover core paths such as:
+| Test File | Count | Description |
+|---|---|---|
+| `case_basic.rs` | 22 | Structural tests for cases 1–6 (control, calls, memory, loops, switch, string) |
+| `case_complex.rs` | 40 | Structural tests for cases 7–10 (complex, state machine, algorithms, mixed) |
+| `opt_matrix.rs` | 450 | Cross-platform smoke tests across 2 platforms × 3 optimization levels (O1/O2/O3) |
+| `cfg_tests.rs` | 1 | CFG construction verification |
+| `ida_style.rs` | 3 | IDA Hex-Rays style formatting |
+| `interprocedural.rs` | 2 | Cross-function call graph analysis |
+| `ir_structure.rs` | 2 | IR lifting structure checks |
+| `loader.rs` | 6 | ELF/PE loading, symbols, sections |
+| **Unit tests** | **33** | Internal module tests |
+| **Total** | **559** | |
 
-- loader behavior
-- CFG construction
-- IR structure
-- interprocedural logic
-- IDA-style formatting
-- basic and more complex decompilation cases
+### Platforms / 平台
+
+Tests cover **ELF** (WSL/Linux) and **PE** (Windows) binaries at three gcc optimization levels (**-O1**, **-O2**, **-O3**), totaling 6 platform × optimization combinations per function.
 
 ### 中文
 
-当前测试主要覆盖以下核心路径：
-
-- 加载器行为
-- CFG 构建
-- IR 结构
-- 跨函数分析
-- IDA 风格输出
-- 基础与较复杂反编译案例
+测试覆盖了 **ELF**（WSL/Linux）和 **PE**（Windows）两种平台的二进制文件，在 **-O1**、**-O2**、**-O3** 三个 gcc 优化级别下共 6 种组合。10 个 C 测试案例（约 75 个函数），加上装载器、CFG、IR、跨函数分析等核心路径的结构化测试，全部 559 个测试通过。
 
 ---
 
