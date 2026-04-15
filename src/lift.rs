@@ -48,6 +48,12 @@ pub struct Lifter {
     frame_size: u64,
     has_frame_pointer: bool,
     saw_push_rbp: bool,
+    /// True when the function writes to XMM0 (float/SSE return value).
+    writes_xmm0: bool,
+    /// True when the function writes to RAX/EAX via non-call instructions.
+    writes_rax_noncall: bool,
+    /// True when the last seen write was to XMM0 (vs RAX).
+    last_write_is_xmm0: bool,
 }
 
 impl Lifter {
@@ -61,6 +67,9 @@ impl Lifter {
             frame_size: 0,
             has_frame_pointer: false,
             saw_push_rbp: false,
+            writes_xmm0: false,
+            writes_rax_noncall: false,
+            last_write_is_xmm0: false,
         }
     }
 
@@ -100,6 +109,9 @@ impl Lifter {
         self.frame_size = 0;
         self.has_frame_pointer = false;
         self.saw_push_rbp = false;
+        self.writes_xmm0 = false;
+        self.writes_rax_noncall = false;
+        self.last_write_is_xmm0 = false;
 
         let addr_to_block: BTreeMap<u64, BlockId> = cfg
             .blocks
@@ -125,7 +137,9 @@ impl Lifter {
             // contains no flag-setting instructions (e.g. a bare conditional
             // jump that tests flags from the preceding block), try to inherit
             // the flag state from a predecessor that has already been lifted.
+            // Reset per-block state
             self.flag_state = None;
+            self.last_write_is_xmm0 = false;
             {
                 // Build a set of predecessor addresses for this block
                 let preds: Vec<u64> = cfg.blocks.iter()
@@ -158,6 +172,24 @@ impl Lifter {
                     continue;
                 }
                 let mut lifted = self.lift_instruction(insn);
+                // Track writes to XMM0/RAX for return detection
+                for s in &lifted {
+                    match s {
+                        Stmt::Assign(Var::Reg(RegId::Xmm0, _), _) => {
+                            self.writes_xmm0 = true;
+                            self.last_write_is_xmm0 = true;
+                        }
+                        Stmt::Assign(Var::Reg(RegId::Rax, _), _) => {
+                            self.writes_rax_noncall = true;
+                            self.last_write_is_xmm0 = false;
+                        }
+                        Stmt::Call(Some(Var::Reg(RegId::Rax, _)), _, _) => {
+                            // Call clobbers rax but doesn't count as intentional rax return
+                            self.last_write_is_xmm0 = false;
+                        }
+                        _ => {}
+                    }
+                }
                 stmts.append(&mut lifted);
             }
 
@@ -261,16 +293,101 @@ impl Lifter {
             // SSE scalar move/arithmetic (Movsd is also used for SSE scalar double)
             Mnemonic::Movss | Mnemonic::Movsd | Mnemonic::Movaps | Mnemonic::Movups
             | Mnemonic::Movapd | Mnemonic::Movupd => self.lift_mov(insn),
-            Mnemonic::Addss | Mnemonic::Addsd => self.lift_arith(insn, BinOp::Add),
-            Mnemonic::Subss | Mnemonic::Subsd => self.lift_arith(insn, BinOp::Sub),
-            Mnemonic::Mulss | Mnemonic::Mulsd => self.lift_arith(insn, BinOp::Mul),
-            Mnemonic::Divss | Mnemonic::Divsd => self.lift_arith(insn, BinOp::SDiv),
+            Mnemonic::Addss | Mnemonic::Addsd => self.lift_float_arith(insn, "add"),
+            Mnemonic::Subss | Mnemonic::Subsd => self.lift_float_arith(insn, "sub"),
+            Mnemonic::Mulss | Mnemonic::Mulsd => self.lift_float_arith(insn, "mul"),
+            Mnemonic::Divss | Mnemonic::Divsd => self.lift_float_arith(insn, "div"),
+            // Scalar float comparison
+            Mnemonic::Ucomiss | Mnemonic::Ucomisd
+            | Mnemonic::Comiss | Mnemonic::Comisd => self.lift_float_cmp(insn),
             // SSE XOR (zero-init pattern: xorps xmm0, xmm0)
             Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => self.lift_xor(insn),
             // CVTSI2SS/SD (int → float)
-            Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => self.lift_mov(insn),
+            Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => self.lift_cvtsi2f(insn),
             // CVTTSS2SI/CVTTSD2SI (float → int truncation)
-            Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si => self.lift_mov(insn),
+            Mnemonic::Cvttss2si | Mnemonic::Cvttsd2si => self.lift_cvtf2si(insn),
+            // CVTSS2SD / CVTSD2SS (float precision conversion)
+            Mnemonic::Cvtss2sd | Mnemonic::Cvtsd2ss => self.lift_mov(insn),
+            // MOVD/MOVQ — XMM ↔ GPR bitcast or 32/64-bit move
+            Mnemonic::Movd | Mnemonic::Movq => self.lift_movd(insn),
+            // ── SSE2 packed integer instructions (IDA-style intrinsics) ──
+            Mnemonic::Movdqa | Mnemonic::Movdqu => self.lift_simd_mov(insn),
+            Mnemonic::Pcmpeqb => self.lift_simd_binop(insn, "_mm_cmpeq_epi8"),
+            Mnemonic::Pcmpeqw => self.lift_simd_binop(insn, "_mm_cmpeq_epi16"),
+            Mnemonic::Pcmpeqd => self.lift_simd_binop(insn, "_mm_cmpeq_epi32"),
+            Mnemonic::Pcmpgtb => self.lift_simd_binop(insn, "_mm_cmpgt_epi8"),
+            Mnemonic::Pcmpgtw => self.lift_simd_binop(insn, "_mm_cmpgt_epi16"),
+            Mnemonic::Pcmpgtd => self.lift_simd_binop(insn, "_mm_cmpgt_epi32"),
+            Mnemonic::Paddb => self.lift_simd_binop(insn, "_mm_add_epi8"),
+            Mnemonic::Paddw => self.lift_simd_binop(insn, "_mm_add_epi16"),
+            Mnemonic::Paddd => self.lift_simd_binop(insn, "_mm_add_epi32"),
+            Mnemonic::Paddq => self.lift_simd_binop(insn, "_mm_add_epi64"),
+            Mnemonic::Psubb => self.lift_simd_binop(insn, "_mm_sub_epi8"),
+            Mnemonic::Psubw => self.lift_simd_binop(insn, "_mm_sub_epi16"),
+            Mnemonic::Psubd => self.lift_simd_binop(insn, "_mm_sub_epi32"),
+            Mnemonic::Psubq => self.lift_simd_binop(insn, "_mm_sub_epi64"),
+            Mnemonic::Pmullw => self.lift_simd_binop(insn, "_mm_mullo_epi16"),
+            Mnemonic::Pmulld => self.lift_simd_binop(insn, "_mm_mullo_epi32"),
+            Mnemonic::Pand => self.lift_simd_binop(insn, "_mm_and_si128"),
+            Mnemonic::Pandn => self.lift_simd_binop(insn, "_mm_andnot_si128"),
+            Mnemonic::Por => self.lift_simd_binop(insn, "_mm_or_si128"),
+            Mnemonic::Punpcklbw => self.lift_simd_binop(insn, "_mm_unpacklo_epi8"),
+            Mnemonic::Punpckhbw => self.lift_simd_binop(insn, "_mm_unpackhi_epi8"),
+            Mnemonic::Punpcklwd => self.lift_simd_binop(insn, "_mm_unpacklo_epi16"),
+            Mnemonic::Punpckhwd => self.lift_simd_binop(insn, "_mm_unpackhi_epi16"),
+            Mnemonic::Punpckldq => self.lift_simd_binop(insn, "_mm_unpacklo_epi32"),
+            Mnemonic::Punpckhdq => self.lift_simd_binop(insn, "_mm_unpackhi_epi32"),
+            Mnemonic::Punpcklqdq => self.lift_simd_binop(insn, "_mm_unpacklo_epi64"),
+            Mnemonic::Punpckhqdq => self.lift_simd_binop(insn, "_mm_unpackhi_epi64"),
+            Mnemonic::Packuswb => self.lift_simd_binop(insn, "_mm_packus_epi16"),
+            Mnemonic::Packsswb => self.lift_simd_binop(insn, "_mm_packs_epi16"),
+            Mnemonic::Packssdw => self.lift_simd_binop(insn, "_mm_packs_epi32"),
+            // Shift by immediate
+            Mnemonic::Psraw => self.lift_simd_shift(insn, "_mm_srai_epi16"),
+            Mnemonic::Psrad => self.lift_simd_shift(insn, "_mm_srai_epi32"),
+            Mnemonic::Psrlw => self.lift_simd_shift(insn, "_mm_srli_epi16"),
+            Mnemonic::Psrld => self.lift_simd_shift(insn, "_mm_srli_epi32"),
+            Mnemonic::Psrlq => self.lift_simd_shift(insn, "_mm_srli_epi64"),
+            Mnemonic::Psllw => self.lift_simd_shift(insn, "_mm_slli_epi16"),
+            Mnemonic::Pslld => self.lift_simd_shift(insn, "_mm_slli_epi32"),
+            Mnemonic::Psllq => self.lift_simd_shift(insn, "_mm_slli_epi64"),
+            // Byte-level shift of entire 128-bit register
+            Mnemonic::Psrldq => self.lift_simd_shift(insn, "_mm_srli_si128"),
+            Mnemonic::Pslldq => self.lift_simd_shift(insn, "_mm_slli_si128"),
+            // Shuffle
+            Mnemonic::Pshufd => self.lift_simd_shuffle(insn, "_mm_shuffle_epi32"),
+            Mnemonic::Pshufhw => self.lift_simd_shuffle(insn, "_mm_shufflehi_epi16"),
+            Mnemonic::Pshuflw => self.lift_simd_shuffle(insn, "_mm_shufflelo_epi16"),
+            Mnemonic::Shufps => self.lift_simd_shuffle(insn, "_mm_shuffle_ps"),
+            Mnemonic::Shufpd => self.lift_simd_shuffle(insn, "_mm_shuffle_pd"),
+            // Min/Max
+            Mnemonic::Pminsb => self.lift_simd_binop(insn, "_mm_min_epi8"),
+            Mnemonic::Pminub => self.lift_simd_binop(insn, "_mm_min_epu8"),
+            Mnemonic::Pminsw => self.lift_simd_binop(insn, "_mm_min_epi16"),
+            Mnemonic::Pminsd => self.lift_simd_binop(insn, "_mm_min_epi32"),
+            Mnemonic::Pmaxsb => self.lift_simd_binop(insn, "_mm_max_epi8"),
+            Mnemonic::Pmaxub => self.lift_simd_binop(insn, "_mm_max_epu8"),
+            Mnemonic::Pmaxsw => self.lift_simd_binop(insn, "_mm_max_epi16"),
+            Mnemonic::Pmaxsd => self.lift_simd_binop(insn, "_mm_max_epi32"),
+            // Extract/insert
+            Mnemonic::Pextrb | Mnemonic::Pextrw | Mnemonic::Pextrd | Mnemonic::Pextrq
+                => self.lift_simd_extract(insn),
+            Mnemonic::Pmovmskb => self.lift_pmovmskb(insn),
+            // Floating-point packed ops (pass through as intrinsic)
+            Mnemonic::Addps => self.lift_simd_binop(insn, "_mm_add_ps"),
+            Mnemonic::Subps => self.lift_simd_binop(insn, "_mm_sub_ps"),
+            Mnemonic::Mulps => self.lift_simd_binop(insn, "_mm_mul_ps"),
+            Mnemonic::Divps => self.lift_simd_binop(insn, "_mm_div_ps"),
+            Mnemonic::Addpd => self.lift_simd_binop(insn, "_mm_add_pd"),
+            Mnemonic::Subpd => self.lift_simd_binop(insn, "_mm_sub_pd"),
+            Mnemonic::Mulpd => self.lift_simd_binop(insn, "_mm_mul_pd"),
+            Mnemonic::Divpd => self.lift_simd_binop(insn, "_mm_div_pd"),
+            Mnemonic::Andps | Mnemonic::Andpd => self.lift_simd_binop(insn, "_mm_and_ps"),
+            Mnemonic::Orps | Mnemonic::Orpd => self.lift_simd_binop(insn, "_mm_or_ps"),
+            Mnemonic::Maxps => self.lift_simd_binop(insn, "_mm_max_ps"),
+            Mnemonic::Minps => self.lift_simd_binop(insn, "_mm_min_ps"),
+            Mnemonic::Maxpd => self.lift_simd_binop(insn, "_mm_max_pd"),
+            Mnemonic::Minpd => self.lift_simd_binop(insn, "_mm_min_pd"),
             Mnemonic::Leave => vec![],
             Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Int3 => vec![],
             _ => vec![Stmt::Nop],
@@ -374,8 +491,15 @@ impl Lifter {
     ) -> Terminator {
         match insn.insn.flow_control() {
             iced_x86::FlowControl::Return => {
-                let ret_w = if self.calling_conv.is_32bit() { BitWidth::Bit32 } else { BitWidth::Bit64 };
-                Terminator::Return(Some(Expr::var(Var::Reg(RegId::Rax, ret_w))))
+                // Float-returning: xmm0 is the return register when it was the
+                // last value written (e.g. `movaps xmm0, xmm1; ret`).
+                // Integer-returning: rax is used when rax was explicitly written.
+                if self.writes_xmm0 && self.last_write_is_xmm0 {
+                    Terminator::Return(Some(Expr::var(Var::Reg(RegId::Xmm0, BitWidth::Bit128))))
+                } else {
+                    let ret_w = if self.calling_conv.is_32bit() { BitWidth::Bit32 } else { BitWidth::Bit64 };
+                    Terminator::Return(Some(Expr::var(Var::Reg(RegId::Rax, ret_w))))
+                }
             }
             iced_x86::FlowControl::UnconditionalBranch => {
                 if let Some(target) = insn.branch_target() {
@@ -689,9 +813,14 @@ impl Lifter {
             Expr::const_val(0, w)
         };
 
-        // result = dst - src - cf
-        let sub1 = Expr::binop(BinOp::Sub, dst_val, src);
-        let result = Expr::binop(BinOp::Sub, sub1, cf_val);
+        // Idiom: sbb reg, reg → result = 0 - CF = -CF
+        // This is a well-known x86 pattern: produces -1 if CF=1, 0 if CF=0.
+        let result = if dst_val == src {
+            Expr::unaryop(UnaryOp::Neg, cf_val)
+        } else {
+            let sub1 = Expr::binop(BinOp::Sub, dst_val, src);
+            Expr::binop(BinOp::Sub, sub1, cf_val)
+        };
 
         self.flag_state = Some(FlagState {
             kind: FlagKind::Arith,
@@ -789,13 +918,20 @@ impl Lifter {
         let w = operand_width(&insn.insn, 0);
         match dst {
             Some(var) => {
-                // NEG sets flags like SUB 0, operand: SF/ZF/CF based on result
+                // NEG sets flags like CMP 0, operand (i.e., SUB 0, operand).
+                // We capture the pre-neg operand in a temp so that the flag
+                // state references the ORIGINAL value, not the post-neg register.
                 if op == UnaryOp::Neg {
+                    let pre_neg = self.new_temp(w);
                     self.flag_state = Some(FlagState {
-                        kind: FlagKind::Arith,
-                        lhs: Expr::var(var.clone()),
-                        rhs: Expr::const_val(0, w),
+                        kind: FlagKind::Cmp,
+                        lhs: Expr::const_val(0, w),
+                        rhs: Expr::var(pre_neg.clone()),
                     });
+                    return vec![
+                        Stmt::Assign(pre_neg, val.clone()),
+                        Stmt::Assign(var, Expr::unaryop(op, val)),
+                    ];
                 }
                 vec![Stmt::Assign(var, Expr::unaryop(op, val))]
             }
@@ -918,6 +1054,182 @@ impl Lifter {
             Expr::Const(SYNTHETIC_MEMSET, BitWidth::Bit64),
             vec![dst, val, cnt],
         )]
+    }
+
+    // ── SIMD / SSE lifting helpers ─────────────────────────────
+
+    /// Lift MOVDQA/MOVDQU: 128-bit aligned/unaligned move.
+    fn lift_simd_mov(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        // Same as regular mov, width is 128-bit from register/memory size
+        self.lift_mov(insn)
+    }
+
+    /// Lift a packed SIMD binary op as `dst = intrinsic(dst, src)`.
+    fn lift_simd_binop(&mut self, insn: &DisasmInsn, name: &str) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let lhs = self.lift_operand(&insn.insn, 0);
+        let rhs = self.lift_operand(&insn.insn, 1);
+        let result = Expr::intrinsic(name, vec![lhs, rhs]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => {
+                let addr = self.lift_memory_operand(&insn.insn, 0);
+                vec![Stmt::Store(addr, result, BitWidth::Bit128)]
+            }
+        }
+    }
+
+    /// Lift packed shift: `dst = intrinsic(dst, imm)`.
+    fn lift_simd_shift(&mut self, insn: &DisasmInsn, name: &str) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 0);
+        let amt = self.lift_operand(&insn.insn, 1);
+        let result = Expr::intrinsic(name, vec![src, amt]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => vec![Stmt::Nop],
+        }
+    }
+
+    /// Lift packed shuffle with immediate: `dst = intrinsic(src, imm8)`.
+    fn lift_simd_shuffle(&mut self, insn: &DisasmInsn, name: &str) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let imm = if insn.insn.op_count() >= 3 {
+            self.lift_operand(&insn.insn, 2)
+        } else {
+            Expr::const_val(0, BitWidth::Bit8)
+        };
+        let result = Expr::intrinsic(name, vec![src, imm]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => vec![Stmt::Nop],
+        }
+    }
+
+    /// Lift PEXTRB/W/D/Q: extract element from XMM to GPR.
+    fn lift_simd_extract(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let idx = self.lift_operand(&insn.insn, 2);
+        let name = match insn.mnemonic {
+            Mnemonic::Pextrb => "_mm_extract_epi8",
+            Mnemonic::Pextrw => "_mm_extract_epi16",
+            Mnemonic::Pextrd => "_mm_extract_epi32",
+            Mnemonic::Pextrq => "_mm_extract_epi64",
+            _ => "_mm_extract_epi32",
+        };
+        let result = Expr::intrinsic(name, vec![src, idx]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => {
+                let addr = self.lift_memory_operand(&insn.insn, 0);
+                vec![Stmt::Store(addr, result, operand_width(&insn.insn, 0))]
+            }
+        }
+    }
+
+    /// Lift PMOVMSKB: extract byte mask from XMM to GPR.
+    fn lift_pmovmskb(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let result = Expr::intrinsic("_mm_movemask_epi8", vec![src]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => vec![Stmt::Nop],
+        }
+    }
+
+    /// Lift MOVD/MOVQ: XMM ↔ GPR transfer (bitcast semantics).
+    fn lift_movd(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst_is_xmm = insn.insn.op0_kind() == OpKind::Register
+            && map_register(insn.insn.op0_register()).0.is_xmm();
+        let src_is_xmm = insn.insn.op1_kind() == OpKind::Register
+            && map_register(insn.insn.op1_register()).0.is_xmm();
+
+        if dst_is_xmm && !src_is_xmm {
+            // GPR/mem → XMM: _mm_cvtsi32_si128 or _mm_cvtsi64_si128
+            let dst = self.lift_operand_as_var(&insn.insn, 0);
+            let src = self.lift_operand(&insn.insn, 1);
+            let name = if insn.mnemonic == Mnemonic::Movq { "_mm_cvtsi64_si128" } else { "_mm_cvtsi32_si128" };
+            let result = Expr::intrinsic(name, vec![src]);
+            match dst {
+                Some(var) => vec![Stmt::Assign(var, result)],
+                None => vec![Stmt::Nop],
+            }
+        } else if !dst_is_xmm && src_is_xmm {
+            // XMM → GPR/mem: _mm_cvtsi128_si32 or _mm_cvtsi128_si64
+            let dst = self.lift_operand_as_var(&insn.insn, 0);
+            let src = self.lift_operand(&insn.insn, 1);
+            let name = if insn.mnemonic == Mnemonic::Movq { "_mm_cvtsi128_si64" } else { "_mm_cvtsi128_si32" };
+            let result = Expr::intrinsic(name, vec![src]);
+            match dst {
+                Some(var) => vec![Stmt::Assign(var, result)],
+                None => {
+                    let addr = self.lift_memory_operand(&insn.insn, 0);
+                    let w = if insn.mnemonic == Mnemonic::Movq { BitWidth::Bit64 } else { BitWidth::Bit32 };
+                    vec![Stmt::Store(addr, result, w)]
+                }
+            }
+        } else {
+            // XMM → XMM or mem → XMM without GPR: just move
+            self.lift_mov(insn)
+        }
+    }
+
+    /// Lift scalar float arithmetic: addss/subss/mulss/divss etc.
+    /// Produces `xmm = xmm <op> src` directly (not intrinsic).
+    fn lift_float_arith(&mut self, insn: &DisasmInsn, op: &str) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let lhs = self.lift_operand(&insn.insn, 0);
+        let rhs = self.lift_operand(&insn.insn, 1);
+        let binop = match op {
+            "add" => BinOp::Add,
+            "sub" => BinOp::Sub,
+            "mul" => BinOp::Mul,
+            "div" => BinOp::SDiv,
+            _ => BinOp::Add,
+        };
+        let result = Expr::binop(binop, lhs, rhs);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => {
+                let addr = self.lift_memory_operand(&insn.insn, 0);
+                vec![Stmt::Store(addr, result, operand_width(&insn.insn, 0))]
+            }
+        }
+    }
+
+    /// Lift UCOMISS/UCOMISD: scalar float comparison → flags.
+    fn lift_float_cmp(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let lhs = self.lift_operand(&insn.insn, 0);
+        let rhs = self.lift_operand(&insn.insn, 1);
+        self.flag_state = Some(FlagState { kind: FlagKind::Cmp, lhs, rhs });
+        vec![]
+    }
+
+    /// Lift CVTSI2SS/CVTSI2SD: int → float conversion.
+    fn lift_cvtsi2f(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let name = if insn.mnemonic == Mnemonic::Cvtsi2sd { "_mm_cvtsi32_sd" } else { "_mm_cvtsi32_ss" };
+        let result = Expr::intrinsic(name, vec![src]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => vec![Stmt::Nop],
+        }
+    }
+
+    /// Lift CVTTSS2SI/CVTTSD2SI: float → int truncation.
+    fn lift_cvtf2si(&mut self, insn: &DisasmInsn) -> Vec<Stmt> {
+        let dst = self.lift_operand_as_var(&insn.insn, 0);
+        let src = self.lift_operand(&insn.insn, 1);
+        let name = if insn.mnemonic == Mnemonic::Cvttsd2si { "_mm_cvttsd_si32" } else { "_mm_cvttss_si32" };
+        let result = Expr::intrinsic(name, vec![src]);
+        match dst {
+            Some(var) => vec![Stmt::Assign(var, result)],
+            None => vec![Stmt::Nop],
+        }
     }
 
     // ── operand helpers ─────────────────────────────────────────
@@ -1115,23 +1427,23 @@ fn map_register(reg: Register) -> (RegId, BitWidth) {
         Register::BH => (RegId::Rbx, BitWidth::Bit8),
         Register::CH => (RegId::Rcx, BitWidth::Bit8),
         Register::DH => (RegId::Rdx, BitWidth::Bit8),
-        // SSE registers (XMM0–XMM15) — 128-bit, but we model scalar use as 64-bit
-        Register::XMM0  => (RegId::Xmm0,  BitWidth::Bit64),
-        Register::XMM1  => (RegId::Xmm1,  BitWidth::Bit64),
-        Register::XMM2  => (RegId::Xmm2,  BitWidth::Bit64),
-        Register::XMM3  => (RegId::Xmm3,  BitWidth::Bit64),
-        Register::XMM4  => (RegId::Xmm4,  BitWidth::Bit64),
-        Register::XMM5  => (RegId::Xmm5,  BitWidth::Bit64),
-        Register::XMM6  => (RegId::Xmm6,  BitWidth::Bit64),
-        Register::XMM7  => (RegId::Xmm7,  BitWidth::Bit64),
-        Register::XMM8  => (RegId::Xmm8,  BitWidth::Bit64),
-        Register::XMM9  => (RegId::Xmm9,  BitWidth::Bit64),
-        Register::XMM10 => (RegId::Xmm10, BitWidth::Bit64),
-        Register::XMM11 => (RegId::Xmm11, BitWidth::Bit64),
-        Register::XMM12 => (RegId::Xmm12, BitWidth::Bit64),
-        Register::XMM13 => (RegId::Xmm13, BitWidth::Bit64),
-        Register::XMM14 => (RegId::Xmm14, BitWidth::Bit64),
-        Register::XMM15 => (RegId::Xmm15, BitWidth::Bit64),
+        // SSE registers (XMM0–XMM15) — 128-bit
+        Register::XMM0  => (RegId::Xmm0,  BitWidth::Bit128),
+        Register::XMM1  => (RegId::Xmm1,  BitWidth::Bit128),
+        Register::XMM2  => (RegId::Xmm2,  BitWidth::Bit128),
+        Register::XMM3  => (RegId::Xmm3,  BitWidth::Bit128),
+        Register::XMM4  => (RegId::Xmm4,  BitWidth::Bit128),
+        Register::XMM5  => (RegId::Xmm5,  BitWidth::Bit128),
+        Register::XMM6  => (RegId::Xmm6,  BitWidth::Bit128),
+        Register::XMM7  => (RegId::Xmm7,  BitWidth::Bit128),
+        Register::XMM8  => (RegId::Xmm8,  BitWidth::Bit128),
+        Register::XMM9  => (RegId::Xmm9,  BitWidth::Bit128),
+        Register::XMM10 => (RegId::Xmm10, BitWidth::Bit128),
+        Register::XMM11 => (RegId::Xmm11, BitWidth::Bit128),
+        Register::XMM12 => (RegId::Xmm12, BitWidth::Bit128),
+        Register::XMM13 => (RegId::Xmm13, BitWidth::Bit128),
+        Register::XMM14 => (RegId::Xmm14, BitWidth::Bit128),
+        Register::XMM15 => (RegId::Xmm15, BitWidth::Bit128),
         _ => (RegId::Rax, BitWidth::Bit64),
     }
 }
@@ -1142,8 +1454,12 @@ fn operand_width(insn: &iced_x86::Instruction, op_idx: u32) -> BitWidth {
         OpKind::Memory => match insn.memory_size() {
             iced_x86::MemorySize::UInt8  | iced_x86::MemorySize::Int8  => BitWidth::Bit8,
             iced_x86::MemorySize::UInt16 | iced_x86::MemorySize::Int16 => BitWidth::Bit16,
-            iced_x86::MemorySize::UInt32 | iced_x86::MemorySize::Int32 => BitWidth::Bit32,
-            iced_x86::MemorySize::UInt64 | iced_x86::MemorySize::Int64 => BitWidth::Bit64,
+            iced_x86::MemorySize::UInt32 | iced_x86::MemorySize::Int32
+            | iced_x86::MemorySize::Float32 => BitWidth::Bit32,
+            iced_x86::MemorySize::UInt64 | iced_x86::MemorySize::Int64
+            | iced_x86::MemorySize::Float64 => BitWidth::Bit64,
+            iced_x86::MemorySize::UInt128 | iced_x86::MemorySize::Int128
+            | iced_x86::MemorySize::Packed128_Float32 | iced_x86::MemorySize::Packed128_Float64 => BitWidth::Bit128,
             _ => BitWidth::Bit64,
         },
         _ => BitWidth::Bit64,

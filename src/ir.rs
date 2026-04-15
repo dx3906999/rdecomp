@@ -31,6 +31,12 @@ pub enum CType {
     Bool,
     /// Void (for return types).
     Void,
+    /// 32-bit IEEE 754 float.
+    Float32,
+    /// 64-bit IEEE 754 double.
+    Float64,
+    /// 128-bit SSE integer vector (__m128i).
+    Vec128i,
     /// Unknown / not yet inferred.
     Unknown,
 }
@@ -47,10 +53,14 @@ impl CType {
             CType::Int(BitWidth::Bit32, _) => "uint32_t",
             CType::Int(BitWidth::Bit64, Signedness::Signed) => "int64_t",
             CType::Int(BitWidth::Bit64, _) => "uint64_t",
+            CType::Int(BitWidth::Bit128, _) => "__m128i",
             CType::Ptr(_) => "void*",
             CType::Char => "char",
             CType::Bool => "bool",
             CType::Void => "void",
+            CType::Float32 => "float",
+            CType::Float64 => "double",
+            CType::Vec128i => "__m128i",
             CType::Unknown => "uint64_t",
         }
     }
@@ -63,6 +73,7 @@ pub enum BitWidth {
     Bit16,
     Bit32,
     Bit64,
+    Bit128,
 }
 
 impl BitWidth {
@@ -72,6 +83,7 @@ impl BitWidth {
             Self::Bit16 => 2,
             Self::Bit32 => 4,
             Self::Bit64 => 8,
+            Self::Bit128 => 16,
         }
     }
 
@@ -87,6 +99,7 @@ impl fmt::Display for BitWidth {
             Self::Bit16 => write!(f, "u16"),
             Self::Bit32 => write!(f, "u32"),
             Self::Bit64 => write!(f, "u64"),
+            Self::Bit128 => write!(f, "__m128i"),
         }
     }
 }
@@ -346,6 +359,8 @@ pub enum Expr {
     LogicalOr(Box<Expr>, Box<Expr>),
     /// Ternary select: `cond ? true_val : false_val` (from CMOV).
     Select(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// SIMD/SSE intrinsic call: Intrinsic(name, args).
+    Intrinsic(String, Vec<Expr>),
 }
 
 impl Expr {
@@ -367,6 +382,14 @@ impl Expr {
             Self::Cond(_) | Self::Cmp(..) => BitWidth::Bit8,
             Self::LogicalAnd(..) | Self::LogicalOr(..) => BitWidth::Bit8,
             Self::Select(_, true_val, _) => true_val.width(),
+            Self::Intrinsic(name, _) => {
+                // Intrinsics returning scalar int32 (e.g. _mm_cvtsi128_si32, _mm_movemask_epi8)
+                if name.contains("cvtsi128_si32") || name.contains("movemask") {
+                    BitWidth::Bit32
+                } else {
+                    BitWidth::Bit128
+                }
+            }
         }
     }
 
@@ -398,6 +421,10 @@ impl Expr {
         Self::Select(Box::new(cond), Box::new(true_val), Box::new(false_val))
     }
 
+    pub fn intrinsic(name: impl Into<String>, args: Vec<Expr>) -> Self {
+        Self::Intrinsic(name.into(), args)
+    }
+
     /// Returns true if this expression or any sub-expression satisfies the predicate.
     pub fn any(&self, pred: &dyn Fn(&Expr) -> bool) -> bool {
         if pred(self) {
@@ -410,6 +437,7 @@ impl Expr {
             | Self::LogicalOr(l, r) => l.any(pred) || r.any(pred),
             Self::UnaryOp(_, inner) | Self::Load(inner, _) => inner.any(pred),
             Self::Select(c, t, f) => c.any(pred) || t.any(pred) || f.any(pred),
+            Self::Intrinsic(_, args) => args.iter().any(|a| a.any(pred)),
             _ => false,
         }
     }
@@ -431,6 +459,9 @@ impl Expr {
                 t.walk(f);
                 f_.walk(f);
             }
+            Self::Intrinsic(_, args) => {
+                for a in args { a.walk(f); }
+            }
             _ => {}
         }
     }
@@ -451,6 +482,9 @@ impl Expr {
                 c.walk_mut(f);
                 t.walk_mut(f);
                 e.walk_mut(f);
+            }
+            Self::Intrinsic(_, args) => {
+                for a in args { a.walk_mut(f); }
             }
             _ => {}
         }
@@ -477,6 +511,10 @@ impl fmt::Display for Expr {
             Self::LogicalAnd(lhs, rhs) => write!(f, "({lhs} && {rhs})"),
             Self::LogicalOr(lhs, rhs) => write!(f, "({lhs} || {rhs})"),
             Self::Select(cond, t, e) => write!(f, "({cond} ? {t} : {e})"),
+            Self::Intrinsic(name, args) => {
+                let args_str: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
+                write!(f, "{name}({})" , args_str.join(", "))
+            }
         }
     }
 }
@@ -644,8 +682,11 @@ impl CallingConv {
     /// Get parameter registers in order.
     pub fn param_regs(&self) -> &[RegId] {
         match self {
-            Self::SystemV => &[RegId::Rdi, RegId::Rsi, RegId::Rdx, RegId::Rcx, RegId::R8, RegId::R9],
-            Self::Win64 => &[RegId::Rcx, RegId::Rdx, RegId::R8, RegId::R9],
+            Self::SystemV => &[RegId::Rdi, RegId::Rsi, RegId::Rdx, RegId::Rcx, RegId::R8, RegId::R9,
+                               RegId::Xmm0, RegId::Xmm1, RegId::Xmm2, RegId::Xmm3,
+                               RegId::Xmm4, RegId::Xmm5, RegId::Xmm6, RegId::Xmm7],
+            Self::Win64 => &[RegId::Rcx, RegId::Rdx, RegId::R8, RegId::R9,
+                             RegId::Xmm0, RegId::Xmm1, RegId::Xmm2, RegId::Xmm3],
             Self::Cdecl => &[],
         }
     }
@@ -714,6 +755,10 @@ pub struct Function {
     /// Inferred return type.
     #[serde(default = "default_return_type")]
     pub return_type: CType,
+    /// Mapping from temp variable ID to the register it was promoted from.
+    /// Populated by register promotion passes in analysis.
+    #[serde(default)]
+    pub temp_reg_origins: HashMap<u32, RegId>,
 }
 
 fn default_return_type() -> CType {
@@ -736,6 +781,7 @@ impl Function {
             buffer_sizes: HashMap::new(),
             var_types: HashMap::new(),
             return_type: CType::Unknown,
+            temp_reg_origins: HashMap::new(),
         }
     }
 
@@ -983,8 +1029,8 @@ mod tests {
 
     #[test]
     fn calling_conv_param_regs() {
-        assert_eq!(CallingConv::SystemV.param_regs().len(), 6);
-        assert_eq!(CallingConv::Win64.param_regs().len(), 4);
+        assert_eq!(CallingConv::SystemV.param_regs().len(), 14);
+        assert_eq!(CallingConv::Win64.param_regs().len(), 8);
         assert_eq!(CallingConv::Cdecl.param_regs().len(), 0);
     }
 

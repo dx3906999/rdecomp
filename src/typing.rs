@@ -30,6 +30,63 @@ pub fn infer_types(func: &mut Function) {
         }
     }
 
+    // Pass 2.5: Refine XMM variables – scalar float vs packed SIMD.
+    // An XMM-derived variable (temp or register) that is never directly
+    // assigned from an Intrinsic expr is used for scalar float arithmetic → Float32.
+    {
+        use std::collections::HashSet;
+
+        // Collect XMM-derived temp IDs
+        let xmm_temps: HashSet<u32> = func.temp_reg_origins.iter()
+            .filter(|(_, reg)| reg.is_xmm())
+            .map(|(id, _)| *id)
+            .collect();
+
+        // Collect XMM registers that appear as Var::Reg assignments
+        let mut xmm_regs: HashSet<RegId> = HashSet::new();
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                if let Stmt::Assign(Var::Reg(r, _), _) = stmt {
+                    if r.is_xmm() { xmm_regs.insert(*r); }
+                }
+            }
+        }
+
+        // Track which are assigned from Intrinsic calls
+        let mut temp_has_intrinsic: HashSet<u32> = HashSet::new();
+        let mut reg_has_intrinsic: HashSet<RegId> = HashSet::new();
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Assign(Var::Temp(id, _), Expr::Intrinsic(..)) => {
+                        if xmm_temps.contains(id) {
+                            temp_has_intrinsic.insert(*id);
+                        }
+                    }
+                    Stmt::Assign(Var::Reg(r, _), Expr::Intrinsic(..)) => {
+                        if r.is_xmm() {
+                            reg_has_intrinsic.insert(*r);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for id in &xmm_temps {
+            if !temp_has_intrinsic.contains(id) {
+                let key = format!("t{id}");
+                types.insert(key, CType::Float32);
+            }
+        }
+        for reg in &xmm_regs {
+            if !reg_has_intrinsic.contains(reg) {
+                let key = format!("{reg}");
+                types.insert(key, CType::Float32);
+            }
+        }
+    }
+
     // Pass 3: Fill remaining variables from their BitWidth
     for block in &func.blocks {
         for stmt in &block.stmts {
@@ -223,7 +280,14 @@ fn expr_type(expr: &Expr, types: &HashMap<String, CType>) -> Option<CType> {
     match expr {
         Expr::Var(v) => types.get(&var_key(v)).cloned(),
         Expr::Const(_, w) => Some(CType::Int(*w, Signedness::Unknown)),
-        Expr::BinOp(op, _, _) => {
+        Expr::BinOp(op, lhs, rhs) => {
+            // If either operand involves an intrinsic (e.g. _mm_cvtsi32_si128),
+            // this is a float/SIMD expression context
+            let lhs_has_intrinsic = matches!(lhs.as_ref(), Expr::Intrinsic(..));
+            let rhs_has_intrinsic = matches!(rhs.as_ref(), Expr::Intrinsic(..));
+            if lhs_has_intrinsic || rhs_has_intrinsic {
+                return Some(CType::Float32);
+            }
             let sign = match op {
                 BinOp::SDiv | BinOp::SMod | BinOp::Slt | BinOp::Sle => Signedness::Signed,
                 BinOp::UDiv | BinOp::UMod | BinOp::Ult | BinOp::Ule => Signedness::Unsigned,
@@ -247,6 +311,13 @@ fn expr_type(expr: &Expr, types: &HashMap<String, CType>) -> Option<CType> {
         }
         Expr::LogicalAnd(..) | Expr::LogicalOr(..) => Some(CType::Bool),
         Expr::Select(_, t, _) => expr_type(t, types),
+        Expr::Intrinsic(name, _) => {
+            if name.contains("cvtsi128_si32") || name.contains("movemask") {
+                Some(CType::Int(BitWidth::Bit32, Signedness::Unknown))
+            } else {
+                Some(CType::Vec128i)
+            }
+        }
     }
 }
 
@@ -263,6 +334,10 @@ fn infer_return_type(func: &Function, types: &HashMap<String, CType>) -> CType {
                 Expr::Var(Var::Reg(RegId::Rax, _)) => {
                     // Look backwards for last assignment to rax in the block
                     find_rax_source_type(block, types)
+                }
+                // return xmm0 → float return
+                Expr::Var(Var::Reg(r, _)) if r.is_xmm() => {
+                    Some(CType::Float32)
                 }
                 Expr::Var(v) => types.get(&var_key(v)).cloned(),
                 _ => expr_type(val, types),

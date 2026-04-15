@@ -580,13 +580,14 @@ impl<'a> CodeGenerator<'a> {
                     BitWidth::Bit16 => *val > 0x7FFF && *val <= 0xFFFF,
                     BitWidth::Bit32 => *val > 0x7FFF_FFFF && *val <= 0xFFFF_FFFF,
                     BitWidth::Bit64 => *val > 0x7FFF_FFFF_FFFF_FFFF,
+                    BitWidth::Bit128 => false,
                 };
                 if is_negative {
                     let signed = match width {
                         BitWidth::Bit8 => (*val as u8) as i8 as i64,
                         BitWidth::Bit16 => (*val as u16) as i16 as i64,
                         BitWidth::Bit32 => (*val as u32) as i32 as i64,
-                        BitWidth::Bit64 => *val as i64,
+                        BitWidth::Bit64 | BitWidth::Bit128 => *val as i64,
                     };
                     return format!("{signed}");
                 }
@@ -717,6 +718,29 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
                 }
+                // Resolve read-only float constants (e.g. 0.5f stored in .rodata)
+                {
+                    let effective_addr = match addr.as_ref() {
+                        Expr::Const(v, _) => Some(*v),
+                        Expr::BinOp(BinOp::Add, lhs, rhs)
+                            if matches!(lhs.as_ref(), Expr::Var(Var::Reg(RegId::Rip, _))) =>
+                        {
+                            if let Expr::Const(v, _) = rhs.as_ref() { Some(*v) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(addr_val) = effective_addr {
+                        if *width == BitWidth::Bit32 {
+                            if let Some(val) = self.binary.read_rodata_f32(addr_val) {
+                                return format_f32(val);
+                            }
+                        } else if *width == BitWidth::Bit64 {
+                            if let Some(val) = self.binary.read_rodata_f64(addr_val) {
+                                return format_f64(val);
+                            }
+                        }
+                    }
+                }
                 format!("*({}*)({})", c_type(*width), self.expr_to_c(addr))
             }
             // A bare Cond can appear when the lifter lost track of which
@@ -758,6 +782,7 @@ impl<'a> CodeGenerator<'a> {
                             BitWidth::Bit16 => *val > 0x7FFF && *val <= 0xFFFF,
                             BitWidth::Bit32 => *val > 0x7FFF_FFFF && *val <= 0xFFFF_FFFF,
                             BitWidth::Bit64 => *val > 0x7FFF_FFFF_FFFF_FFFF,
+                            BitWidth::Bit128 => false,
                         };
                         if high_bit {
                             format!("0x{val:x}")
@@ -784,6 +809,10 @@ impl<'a> CodeGenerator<'a> {
                     return abs_expr;
                 }
                 format!("({} ? {} : {})", self.expr_to_c(cond), self.expr_to_c(t), self.expr_to_c(f))
+            }
+            Expr::Intrinsic(name, args) => {
+                let args_str: Vec<String> = args.iter().map(|a| self.expr_to_c(a)).collect();
+                format!("{}({})", name, args_str.join(", "))
             }
         }
     }
@@ -1128,6 +1157,25 @@ impl<'a> CodeGenerator<'a> {
             }
             Var::Flag(f) => format!("{f}"),
         }
+    }
+}
+
+/// Format an f32 constant as a C float literal.
+fn format_f32(val: f32) -> String {
+    if val == val.trunc() && val.abs() < 1e6 {
+        // Integer-valued float: 1.5 → "1.5f", 0.0 → "0.0f"
+        format!("{val:.1}f")
+    } else {
+        format!("{val}f")
+    }
+}
+
+/// Format an f64 constant as a C double literal.
+fn format_f64(val: f64) -> String {
+    if val == val.trunc() && val.abs() < 1e15 {
+        format!("{val:.1}")
+    } else {
+        format!("{val}")
     }
 }
 

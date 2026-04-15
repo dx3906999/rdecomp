@@ -188,14 +188,15 @@ impl<'a> CodeGenerator<'a> {
             self.var_names.insert(*off, format!("arg_{}", i + 1));
         }
 
-        // Locals: negative offsets sorted by absolute value ascending, then named var_1, var_2, ...
+        // Locals: named by actual stack offset (hex), e.g. var_8 for [rbp-0x8]
         let mut local_offs: Vec<(i64, BitWidth)> = all_offsets.iter()
             .filter(|(off, _)| !param_off_set.contains(off))
             .map(|(off, w)| (*off, *w))
             .collect();
-        local_offs.sort_by_key(|(off, _)| off.unsigned_abs());
-        for (i, (off, _w)) in local_offs.iter().enumerate() {
-            self.var_names.insert(*off, format!("var_{}", i + 1));
+        local_offs.sort_by_key(|(off, _)| *off);
+        for (off, _w) in local_offs.iter() {
+            let abs_off = off.unsigned_abs();
+            self.var_names.insert(*off, format!("var_{abs_off:x}"));
         }
 
         // Semantic variable naming.
@@ -292,12 +293,33 @@ impl<'a> CodeGenerator<'a> {
             let filtered: Vec<_> = locals.iter()
                 .filter(|(name, _, _, _)| !param_var_names.contains(name))
                 .collect();
+            // Build reverse map: variable name → register name (for reg-promoted vars)
+            let reg_name_rev: HashMap<&str, &RegId> = self.reg_var_names.iter()
+                .map(|(reg, name)| (name.as_str(), reg))
+                .collect();
+
             for (name, type_key, width, buf_size) in &filtered {
-                let stack_loc = Self::stack_location_comment(type_key);
+                // Determine the annotation comment for this variable
+                let annotation: Option<String> = if let Some(loc) = Self::stack_location_comment(type_key, func.has_frame_pointer, func.frame_size) {
+                    Some(loc)
+                } else if let Some(id_str) = type_key.strip_prefix('t') {
+                    // Temp variable: look up source register
+                    if let Ok(id) = id_str.parse::<u32>() {
+                        func.temp_reg_origins.get(&id).map(|reg| format!("// {reg}"))
+                    } else {
+                        None
+                    }
+                } else if let Some(reg) = reg_name_rev.get(name.as_str()) {
+                    // Register-promoted variable
+                    Some(format!("// {reg}"))
+                } else {
+                    None
+                };
+
                 if let Some(size) = buf_size {
-                    match stack_loc {
-                        Some(loc) => {
-                            let _ = writeln!(out, "{}char  {}[{}]; {}", self.indent_str(), name, size, loc);
+                    match annotation {
+                        Some(ann) => {
+                            let _ = writeln!(out, "{}char  {}[{}]; {}", self.indent_str(), name, size, ann);
                         }
                         None => {
                             let _ = writeln!(out, "{}char  {}[{}];", self.indent_str(), name, size);
@@ -308,9 +330,9 @@ impl<'a> CodeGenerator<'a> {
                         .map(|t| t.to_c_str())
                         .unwrap_or_else(|| c_type(*width));
                     let ty = if self.ida_style { ida_type(ty) } else { ty.to_string() };
-                    match stack_loc {
-                        Some(loc) => {
-                            let _ = writeln!(out, "{}{}  {}; {}", self.indent_str(), ty, name, loc);
+                    match annotation {
+                        Some(ann) => {
+                            let _ = writeln!(out, "{}{}  {}; {}", self.indent_str(), ty, name, ann);
                         }
                         None => {
                             let _ = writeln!(out, "{}{}  {};", self.indent_str(), ty, name);
@@ -931,6 +953,9 @@ impl<'a> CodeGenerator<'a> {
                 Self::collect_stack_slots_from_expr(then_expr, slots);
                 Self::collect_stack_slots_from_expr(else_expr, slots);
             }
+            Expr::Intrinsic(_, args) => {
+                for a in args { Self::collect_stack_slots_from_expr(a, slots); }
+            }
             Expr::Const(..) | Expr::Cond(_) => {}
         }
     }
@@ -1035,26 +1060,87 @@ impl<'a> CodeGenerator<'a> {
     /// Collect all local variables declared in the function.
     /// Returns (name, type_key, width, optional buffer size).
     fn collect_locals(&self, func: &Function) -> Vec<(String, String, BitWidth, Option<u64>)> {
-        let mut locals: BTreeMap<String, (String, BitWidth, Option<u64>)> = BTreeMap::new();
-
+        let mut seen: HashSet<String> = HashSet::new();
+        // Stack variables: sorted by actual offset
+        let mut stack_locals: Vec<(i64, String, String, BitWidth, Option<u64>)> = Vec::new();
         for (off, width) in Self::collect_stack_slots(func, &self.dead_temps) {
             let name = self.stack_name(off);
-            let type_key = stack_type_key(off);
-            let buf_size = self.buffer_sizes.get(&off).copied();
-            locals.entry(name).or_insert((type_key, width, buf_size));
+            if seen.insert(name.clone()) {
+                let type_key = stack_type_key(off);
+                let buf_size = self.buffer_sizes.get(&off).copied();
+                stack_locals.push((off, name, type_key, width, buf_size));
+            }
         }
+        stack_locals.sort_by_key(|(off, _, _, _, _)| *off);
 
+        // Merge overlapping stack slots into buffer declarations.
+        // When a slot's byte range overlaps with a preceding slot, the preceding
+        // slot is expanded into a buffer covering the whole region. Sub-offset
+        // slots are suppressed from declarations (the body may still reference
+        // them as pseudocode aliases).
+        let mut merged_ends: Vec<(usize, i64)> = Vec::new(); // (group_start_idx, end_offset)
+        {
+            let mut i = 0;
+            while i < stack_locals.len() {
+                let (base_off, _, _, base_w, base_buf) = &stack_locals[i];
+                let base_bytes = base_buf.unwrap_or(base_w.bytes() as u64) as i64;
+                let mut end = *base_off + base_bytes;
+                let mut j = i + 1;
+                while j < stack_locals.len() {
+                    let (next_off, _, _, next_w, next_buf) = &stack_locals[j];
+                    if *next_off < end {
+                        let next_bytes = next_buf.unwrap_or(next_w.bytes() as u64) as i64;
+                        let next_end = *next_off + next_bytes;
+                        if next_end > end {
+                            end = next_end;
+                        }
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if j > i + 1 {
+                    // This group has overlapping entries; record merge info
+                    merged_ends.push((i, end));
+                }
+                i = j;
+            }
+            // Apply merges: set buffer_size on base, mark sub-entries for removal
+            let mut suppress: HashSet<usize> = HashSet::new();
+            for (group_start, end) in &merged_ends {
+                let base_off = stack_locals[*group_start].0;
+                let total_size = (*end - base_off) as u64;
+                stack_locals[*group_start].4 = Some(total_size);
+                for k in (*group_start + 1)..stack_locals.len() {
+                    if stack_locals[k].0 < *end {
+                        suppress.insert(k);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !suppress.is_empty() {
+                let mut idx = 0;
+                stack_locals.retain(|_| {
+                    let keep = !suppress.contains(&idx);
+                    idx += 1;
+                    keep
+                });
+            }
+        }
+        // Register-promoted variables
+        let mut reg_locals: Vec<(String, String, BitWidth)> = Vec::new();
         for (reg, name) in &self.reg_var_names {
-            let type_key = format!("{reg}");
-            let width = match reg {
-                RegId::Xmm0 | RegId::Xmm1 | RegId::Xmm2 | RegId::Xmm3 | RegId::Xmm4 | RegId::Xmm5
-                | RegId::Xmm6 | RegId::Xmm7 | RegId::Xmm8 | RegId::Xmm9 | RegId::Xmm10 | RegId::Xmm11
-                | RegId::Xmm12 | RegId::Xmm13 | RegId::Xmm14 | RegId::Xmm15 => BitWidth::Bit64,
-                _ => BitWidth::Bit64,
-            };
-            locals.entry(name.clone()).or_insert((type_key, width, None));
+            if seen.insert(name.clone()) {
+                let type_key = format!("{reg}");
+                let width = if reg.is_xmm() { BitWidth::Bit128 } else { BitWidth::Bit64 };
+                reg_locals.push((name.clone(), type_key, width));
+            }
         }
+        reg_locals.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // Temp variables
+        let mut temp_locals: Vec<(u32, String, BitWidth)> = Vec::new();
         for block in &func.blocks {
             for stmt in &block.stmts {
                 let var = match stmt {
@@ -1062,23 +1148,32 @@ impl<'a> CodeGenerator<'a> {
                     Stmt::Call(Some(v), _, _) => Some(v),
                     _ => None,
                 };
-                if let Some(var) = var {
-                    match var {
-                        Var::Temp(id, w) => {
-                            let key = format!("t{id}");
-                            if !self.dead_temps.contains(id)
-                                && !self.call_results.contains_key(&key)
-                            {
-                                locals.entry(key.clone()).or_insert((key, *w, None));
-                            }
-                        }
-                        _ => {}
+                if let Some(Var::Temp(id, w)) = var {
+                    let key = format!("t{id}");
+                    if !self.dead_temps.contains(id)
+                        && !self.call_results.contains_key(&key)
+                        && seen.insert(key.clone())
+                    {
+                        temp_locals.push((*id, key, *w));
                     }
                 }
             }
         }
+        temp_locals.sort_by_key(|(id, _, _)| *id);
 
-        locals.into_iter().map(|(name, (tk, w, buf))| (name, tk, w, buf)).collect()
+        // Assemble: stack vars (by offset) → temp vars (by id) → reg vars (by name)
+        let mut result: Vec<(String, String, BitWidth, Option<u64>)> = Vec::new();
+        for (_, name, tk, w, buf) in stack_locals {
+            result.push((name, tk, w, buf));
+        }
+        for (id, key, w) in temp_locals {
+            let _ = id;
+            result.push((key.clone(), key, w, None));
+        }
+        for (name, tk, w) in reg_locals {
+            result.push((name, tk, w, None));
+        }
+        result
     }
 
     fn assign_remaining_reg_names(&mut self, func: &Function) {
@@ -1092,11 +1187,16 @@ impl<'a> CodeGenerator<'a> {
             .max()
             .unwrap_or(0)
             + 1;
-        let mut next_var_idx = used_names.iter()
-            .filter_map(|name| name.strip_prefix("var_").and_then(|n| n.parse::<usize>().ok()))
-            .max()
-            .unwrap_or(0)
-            + 1;
+        // Offset-based stack vars use hex names (var_8, var_1c, ...); register-promoted
+        // vars use decimal names (var_100, var_101, ...) starting above 255 to avoid
+        // collisions with any hex offset.
+        let mut next_var_idx = 256.max(
+            used_names.iter()
+                .filter_map(|name| name.strip_prefix("var_").and_then(|n| n.parse::<usize>().ok()))
+                .max()
+                .unwrap_or(0)
+                + 1
+        );
 
         for reg in self.collect_remaining_regs(func) {
             if !seen.insert(reg) {
@@ -1200,6 +1300,9 @@ impl<'a> CodeGenerator<'a> {
                 Self::collect_regs_from_expr(cond, out, seen);
                 Self::collect_regs_from_expr(then_expr, out, seen);
                 Self::collect_regs_from_expr(else_expr, out, seen);
+            }
+            Expr::Intrinsic(_, args) => {
+                for a in args { Self::collect_regs_from_expr(a, out, seen); }
             }
             Expr::Const(..) | Expr::Cond(_) => {}
         }
@@ -1432,12 +1535,22 @@ impl<'a> CodeGenerator<'a> {
         }
     }
 
-    fn stack_location_comment(type_key: &str) -> Option<String> {
+    fn stack_location_comment(type_key: &str, has_frame_pointer: bool, frame_size: u64) -> Option<String> {
         let off = stack_offset_from_type_key(type_key)?;
-        if off >= 0 {
-            Some(format!("// [rbp+0x{:x}]", off))
+        if has_frame_pointer {
+            if off >= 0 {
+                Some(format!("// [rbp+0x{:x}]", off))
+            } else {
+                Some(format!("// [rbp-0x{:x}]", off.unsigned_abs()))
+            }
         } else {
-            Some(format!("// [rbp-0x{:x}]", off.unsigned_abs()))
+            // Convert normalized offset back to RSP-relative displacement.
+            let rsp_disp = off + frame_size as i64;
+            if rsp_disp >= 0 {
+                Some(format!("// [rsp+0x{:x}]", rsp_disp))
+            } else {
+                Some(format!("// [rsp-0x{:x}]", rsp_disp.unsigned_abs()))
+            }
         }
     }
 
@@ -1451,6 +1564,7 @@ fn c_type(width: BitWidth) -> &'static str {
         BitWidth::Bit16 => "uint16_t",
         BitWidth::Bit32 => "uint32_t",
         BitWidth::Bit64 => "uint64_t",
+        BitWidth::Bit128 => "__m128i",
     }
 }
 
@@ -1469,6 +1583,9 @@ fn ida_type(c99: &str) -> String {
         "void*" => "void*".into(),
         "char" => "char".into(),
         "bool" => "_BOOL".into(),
+        "float" => "float".into(),
+        "double" => "double".into(),
+        "__m128i" => "__m128i".into(),
         other => other.into(),
     }
 }
@@ -1499,7 +1616,7 @@ fn signed_const(val: u64, width: BitWidth) -> i64 {
         BitWidth::Bit8 => val as i8 as i64,
         BitWidth::Bit16 => val as i16 as i64,
         BitWidth::Bit32 => val as i32 as i64,
-        BitWidth::Bit64 => val as i64,
+        BitWidth::Bit64 | BitWidth::Bit128 => val as i64,
     }
 }
 

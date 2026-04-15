@@ -301,6 +301,36 @@ impl Binary {
         }
     }
 
+    /// Read a 32-bit float at a virtual address in a read-only section.
+    /// Returns `None` if the address isn't in a read-only data section
+    /// or the value doesn't look like a practical float constant.
+    pub fn read_rodata_f32(&self, addr: u64) -> Option<f32> {
+        let sec = self.section_at(addr)?;
+        if sec.executable { return None; }
+        let bytes = self.read_bytes(addr, 4)?;
+        let val = f32::from_le_bytes(bytes[..4].try_into().ok()?);
+        // Only accept normal floats in a practical range (0.0001 .. 1e10).
+        // This avoids false positives from integer data.
+        if val.is_normal() && val.abs() >= 1e-4 && val.abs() <= 1e10 {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    /// Read a 64-bit double at a virtual address in a read-only section.
+    pub fn read_rodata_f64(&self, addr: u64) -> Option<f64> {
+        let sec = self.section_at(addr)?;
+        if sec.executable { return None; }
+        let bytes = self.read_bytes(addr, 8)?;
+        let val = f64::from_le_bytes(bytes[..8].try_into().ok()?);
+        if val.is_normal() && val.abs() >= 1e-10 && val.abs() <= 1e15 {
+            Some(val)
+        } else {
+            None
+        }
+    }
+
     /// Read a null-terminated C string at a virtual address (max 256 bytes).
     /// Returns `None` if no null terminator is found within 256 bytes.
     pub fn read_cstring_at(&self, addr: u64) -> Option<String> {

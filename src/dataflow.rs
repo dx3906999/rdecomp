@@ -268,16 +268,21 @@ pub fn reaching_definitions(func: &Function) -> HashMap<BlockId, ReachingDefs> {
         has_call: bool,
         /// Definitions accumulated (after last call if any).
         local_defs: HashMap<String, Expr>,
+        /// Variables redefined in this block (after last call).
+        /// Used to invalidate incoming defs whose RHS references these vars.
+        redefined: HashSet<String>,
     }
 
     let mut transfers: Vec<TransferInfo> = Vec::with_capacity(func.blocks.len());
     for block in &func.blocks {
         let mut has_call = false;
         let mut defs: HashMap<String, Expr> = HashMap::new();
+        let mut redefined: HashSet<String> = HashSet::new();
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Assign(var @ Var::Reg(_, _), expr) => {
                     let k = format!("{var}");
+                    redefined.insert(k.clone());
                     // When a variable is reassigned, invalidate any reaching
                     // definitions whose RHS references it — those defs are
                     // stale and would substitute the wrong value.
@@ -291,11 +296,12 @@ pub fn reaching_definitions(func: &Function) -> HashMap<BlockId, ReachingDefs> {
                 Stmt::Call(..) => {
                     has_call = true;
                     defs.clear();
+                    redefined.clear();
                 }
                 _ => {}
             }
         }
-        transfers.push(TransferInfo { has_call, local_defs: defs });
+        transfers.push(TransferInfo { has_call, local_defs: defs, redefined });
     }
 
     // Fixpoint iteration
@@ -335,6 +341,13 @@ pub fn reaching_definitions(func: &Function) -> HashMap<BlockId, ReachingDefs> {
             match incoming {
                 ReachingDefs::Top => ReachingDefs::Map(transfer.local_defs.clone()),
                 ReachingDefs::Map(mut m) => {
+                    // Kill incoming defs whose RHS references a variable
+                    // redefined in this block — those values are stale.
+                    if !transfer.redefined.is_empty() {
+                        m.retain(|_, def_expr| {
+                            !transfer.redefined.iter().any(|rk| expr_uses_key(def_expr, rk))
+                        });
+                    }
                     for (k, v) in &transfer.local_defs {
                         m.insert(k.clone(), v.clone());
                     }

@@ -780,6 +780,7 @@ fn try_fold_binop(op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
                     BitWidth::Bit16 => *c > 0x7FFF && *c <= 0xFFFF,
                     BitWidth::Bit32 => *c > 0x7FFF_FFFF && *c <= 0xFFFF_FFFF,
                     BitWidth::Bit64 => *c > 0x7FFF_FFFF_FFFF_FFFF,
+                    BitWidth::Bit128 => false,
                 };
                 if is_neg {
                     let neg_c = match w {
@@ -787,6 +788,7 @@ fn try_fold_binop(op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
                         BitWidth::Bit16 => (!*c).wrapping_add(1) & 0xFFFF,
                         BitWidth::Bit32 => (!*c).wrapping_add(1) & 0xFFFF_FFFF,
                         BitWidth::Bit64 => (!*c).wrapping_add(1),
+                        BitWidth::Bit128 => (!*c).wrapping_add(1),
                     };
                     return Some(Expr::BinOp(
                         BinOp::Add,
@@ -887,7 +889,7 @@ fn try_fold_unaryop(op: UnaryOp, inner: &Expr) -> Option<Expr> {
                     BitWidth::Bit8 => 0xFF,
                     BitWidth::Bit16 => 0xFFFF,
                     BitWidth::Bit32 => 0xFFFF_FFFF,
-                    BitWidth::Bit64 => u64::MAX,
+                    BitWidth::Bit64 | BitWidth::Bit128 => u64::MAX,
                 };
                 return Some(Expr::Const(val & mask, tw));
             }
@@ -897,7 +899,7 @@ fn try_fold_unaryop(op: UnaryOp, inner: &Expr) -> Option<Expr> {
                     BitWidth::Bit8 => *val as i8 as i64 as u64,
                     BitWidth::Bit16 => *val as i16 as i64 as u64,
                     BitWidth::Bit32 => *val as i32 as i64 as u64,
-                    BitWidth::Bit64 => *val,
+                    BitWidth::Bit64 | BitWidth::Bit128 => *val,
                 };
                 return Some(Expr::Const(sign_extended, tw));
             }
@@ -1347,7 +1349,7 @@ fn sign_extend_offset(val: u64, width: BitWidth) -> i64 {
         BitWidth::Bit8 => val as i8 as i64,
         BitWidth::Bit16 => val as i16 as i64,
         BitWidth::Bit32 => val as i32 as i64,
-        BitWidth::Bit64 => val as i64,
+        BitWidth::Bit64 | BitWidth::Bit128 => val as i64,
     }
 }
 
@@ -1687,6 +1689,19 @@ fn expression_inlining(func: &mut Function) -> bool {
 fn cross_block_temp_inlining(func: &mut Function) -> bool {
     let mut changed = false;
 
+    // Collect registers that are assigned anywhere in the function.
+    // These are NOT stable across blocks (param regs can be reused).
+    let mut written_regs: HashSet<String> = HashSet::new();
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Assign(var @ Var::Reg(_, _), _) => { written_regs.insert(format!("{var}")); }
+                Stmt::Call(Some(var @ Var::Reg(_, _)), _, _) => { written_regs.insert(format!("{var}")); }
+                _ => {}
+            }
+        }
+    }
+
     // Step 1: Collect all temp definitions: temp_key -> (block_idx, stmt_idx, expr)
     // Only consider temps defined exactly once.
     let mut temp_defs: HashMap<String, (usize, usize, Expr)> = HashMap::new();
@@ -1757,7 +1772,7 @@ fn cross_block_temp_inlining(func: &mut Function) -> bool {
                     } else {
                         // Different block: check if any var in expr might be
                         // reassigned. Only safe for simple exprs (Var, Const).
-                        if !expr_is_stable_across_blocks(expr) { break; }
+                        if !expr_is_stable_across_blocks(expr, &written_regs) { break; }
                     }
 
                     inline_var_in_stmt(&mut func.blocks[bi].stmts[si], key, expr);
@@ -1769,23 +1784,23 @@ fn cross_block_temp_inlining(func: &mut Function) -> bool {
             }
             if found { break; }
 
-            // Check terminator
-            if inline_var_in_terminator(&mut func.blocks[bi].terminator, key, expr) {
+            // Check terminator — verify safety BEFORE mutating
+            if terminator_mentions_var(&func.blocks[bi].terminator, key) {
                 if bi == *def_bi {
                     let has_intervening = (*def_si + 1..func.blocks[bi].stmts.len()).any(|i| {
                         stmt_may_clobber_expr(&func.blocks[*def_bi].stmts[i], expr)
                     });
                     if has_intervening {
-                        // Undo �?re-insert the var
-                        // Actually we already mutated...skip this case
                         continue;
                     }
-                } else if !expr_is_stable_across_blocks(expr) {
+                } else if !expr_is_stable_across_blocks(expr, &written_regs) {
                     continue;
                 }
-                to_nop.push((*def_bi, *def_si));
-                changed = true;
-                found = true;
+                if inline_var_in_terminator(&mut func.blocks[bi].terminator, key, expr) {
+                    to_nop.push((*def_bi, *def_si));
+                    changed = true;
+                    found = true;
+                }
             }
             if found { break; }
         }
@@ -1827,7 +1842,7 @@ fn cross_block_temp_inlining(func: &mut Function) -> bool {
         // Find the first eligible temp to propagate
         let mut propagated = false;
         for (key, (def_bi, def_si, expr)) in &round_defs {
-            if !expr_is_stable_across_blocks(expr) { continue; }
+            if !expr_is_stable_across_blocks(expr, &written_regs) { continue; }
             if expr_contains_load(expr) || expr_contains_call_or_store(expr) { continue; }
 
             let mut use_count = 0usize;
@@ -1901,16 +1916,20 @@ fn expr_contains_call_or_store(_expr: &Expr) -> bool {
 /// Check if an expression is "stable" across block boundaries �?i.e., its
 /// sub-expressions won't be modified by intervening statements in other blocks.
 /// Conservative: only allow Var (args, stack vars, temps), Const, and simple ops on them.
-fn expr_is_stable_across_blocks(expr: &Expr) -> bool {
+fn expr_is_stable_across_blocks(expr: &Expr, written_regs: &HashSet<String>) -> bool {
     match expr {
         Expr::Var(Var::Temp(_, _)) => true, // temps aren't reassigned if single-def
         Expr::Var(Var::Stack(_, _)) => true, // stack vars stable at late stage
-        Expr::Var(Var::Reg(_, _)) => true,   // after PromoteAllRegs, no more reg assigns
+        Expr::Var(v @ Var::Reg(_, _)) => {
+            // A register is only stable if it is never reassigned in the function.
+            // Param regs kept by promote_all_regs may still be reused as loop counters.
+            !written_regs.contains(&format!("{v}"))
+        }
         Expr::Const(_, _) => true,
         Expr::BinOp(_, l, r) | Expr::Cmp(_, l, r) => {
-            expr_is_stable_across_blocks(l) && expr_is_stable_across_blocks(r)
+            expr_is_stable_across_blocks(l, written_regs) && expr_is_stable_across_blocks(r, written_regs)
         }
-        Expr::UnaryOp(_, inner) => expr_is_stable_across_blocks(inner),
+        Expr::UnaryOp(_, inner) => expr_is_stable_across_blocks(inner, written_regs),
         Expr::Load(_, _) => false, // memory reads not stable
         _ => false,
     }
@@ -1943,6 +1962,16 @@ fn stmt_mentions_var(stmt: &Stmt, key: &str) -> bool {
             expr_uses_var_key(target, key) || args.iter().any(|a| expr_uses_var_key(a, key))
         }
         Stmt::Nop => false,
+    }
+}
+
+fn terminator_mentions_var(term: &Terminator, key: &str) -> bool {
+    match term {
+        Terminator::Branch(cond, _, _) => expr_uses_var_key(cond, key),
+        Terminator::Return(Some(val)) => expr_uses_var_key(val, key),
+        Terminator::IndirectJump(target) => expr_uses_var_key(target, key),
+        Terminator::Switch(val, _, _) => expr_uses_var_key(val, key),
+        _ => false,
     }
 }
 
@@ -3064,19 +3093,18 @@ fn promote_callee_saved_to_locals(func: &mut Function) {
         }
 
         // Create a temp var and replace all occurrences
-        let temp = func.new_temp(BitWidth::Bit64);
+        let width = if reg.is_xmm() { BitWidth::Bit128 } else { BitWidth::Bit64 };
+        let temp = func.new_temp(width);
+        if let Var::Temp(id, _) = &temp {
+            func.temp_reg_origins.insert(*id, reg);
+        }
         let temp_expr = Expr::Var(temp.clone());
-
         for block in &mut func.blocks {
             for stmt in &mut block.stmts {
-                // Replace LHS assignments
+                // Replace LHS: Assign(Reg(reg), rhs) -> Assign(temp, rhs)
                 match stmt {
                     Stmt::Assign(Var::Reg(r, _), _) if *r == reg => {
                         let Stmt::Assign(v, _) = stmt else { unreachable!() };
-                        *v = temp.clone();
-                    }
-                    Stmt::Call(Some(Var::Reg(r, _)), _, _) if *r == reg => {
-                        let Stmt::Call(Some(v), _, _) = stmt else { unreachable!() };
                         *v = temp.clone();
                     }
                     _ => {}
@@ -3195,7 +3223,11 @@ fn promote_all_regs_to_locals(func: &mut Function) {
     // this pass and has already resolved Return(rax) patterns.
 
     for reg in defined_regs {
-        let temp = func.new_temp(BitWidth::Bit64);
+        let width = if reg.is_xmm() { BitWidth::Bit128 } else { BitWidth::Bit64 };
+        let temp = func.new_temp(width);
+        if let Var::Temp(id, _) = &temp {
+            func.temp_reg_origins.insert(*id, reg);
+        }
         let temp_expr = Expr::Var(temp.clone());
 
         for block in &mut func.blocks {
@@ -3392,6 +3424,9 @@ fn collect_expr_vars(expr: &Expr, vars: &mut HashSet<Var>) {
             collect_expr_vars(c, vars);
             collect_expr_vars(t, vars);
             collect_expr_vars(f, vars);
+        }
+        Expr::Intrinsic(_, args) => {
+            for a in args { collect_expr_vars(a, vars); }
         }
         Expr::Const(_, _) | Expr::Cond(_) => {}
     }
