@@ -25,7 +25,7 @@ macro_rules! define_pass {
 // Early passes
 define_pass!(NoreturnElimination, PassPhase::Early, "noreturn_elimination",
     |func, ctx| { noreturn_elimination(func, &ctx.noreturn_addrs); true });
-define_pass!(StackCanaryElimination, PassPhase::Early, "stack_canary_elimination",
+define_pass!(StackCanaryElimination, PassPhase::Late, "stack_canary_elimination",
     |func, _ctx| { eliminate_stack_canary(func); true });
 
 // Iterative passes
@@ -87,7 +87,6 @@ pub fn default_pass_manager() -> PassManager {
     let mut pm = PassManager::new();
     // Early
     pm.add(Box::new(NoreturnElimination));
-    pm.add(Box::new(StackCanaryElimination));
     // Iterative
     pm.add(Box::new(ConstantFold));
     pm.add(Box::new(DeadNopElimination));
@@ -104,6 +103,7 @@ pub fn default_pass_manager() -> PassManager {
     // Repeated
     pm.add(Box::new(CrossBlockPropagation));
     // Late
+    pm.add(Box::new(StackCanaryElimination));
     pm.add(Box::new(SubstituteParamRegs));
     pm.add(Box::new(EliminateSelfAssignments));
     pm.add(Box::new(PromoteCalleeSaved));
@@ -290,108 +290,34 @@ fn noreturn_elimination(func: &mut Function, noreturn_addrs: &HashSet<u64>) {
 
 // ── Stack canary elimination ─────────────────────────────────────
 
-/// Remove stack canary boilerplate: `var_8 = *(u64*)(fs:0x28)`, the XOR check,
-/// `__stack_chk_fail` call, and the guarding branch.
+/// Beautify stack canary code: keep the canary setup / check / __stack_chk_fail
+/// visible (rendered as `__readfsqword(0x28)` by emit.rs) but fix up return
+/// values that are actually canary XOR scratch results, not real return values.
 fn eliminate_stack_canary(func: &mut Function) {
-    // Step 1: Find the canary stack variable.
-    // Pattern: `reg = Load(FS_CANARY_ADDR)` then `var_N = reg`.
-    // Find the register that carries the canary, then the stack var it's stored into.
-    let mut canary_reg: Option<String> = None;
-    let mut canary_stack_key: Option<String> = None;
-    let mut canary_stack_off: Option<i64> = None;
-
-    'outer: for block in &func.blocks {
+    // Collect canary-tainted variables
+    let mut tainted: HashSet<String> = HashSet::new();
+    for block in &func.blocks {
         for stmt in &block.stmts {
             if let Stmt::Assign(var, expr) = stmt {
                 if expr_references_canary(expr) {
-                    canary_reg = Some(format!("{var}"));
+                    tainted.insert(format!("{var}"));
                 }
-                // If we found the register carrying the canary, look for var_N = reg
-                if let Some(ref reg_key) = canary_reg
-                    && let Var::Stack(off, _) = var
-                        && let Expr::Var(src_var) = expr
-                            && format!("{src_var}") == *reg_key {
-                                canary_stack_key = Some(format!("{var}"));
-                                canary_stack_off = Some(*off);
-                                break 'outer;
-                            }
             }
         }
     }
+    if tainted.is_empty() { return; }
 
-    let Some(canary_key) = canary_stack_key else { return };
-    let canary_reg_key = canary_reg.unwrap();
-    let canary_off = canary_stack_off.unwrap();
+    let is_canary_expr = |expr: &Expr| -> bool {
+        expr_references_canary(expr) || tainted.iter().any(|k| expr_uses_var_key(expr, k))
+    };
 
-    // Pre-collect: which blocks have Unreachable terminator (from noreturn_elimination)
-    let unreachable_blocks: HashSet<BlockId> = func.blocks.iter()
-        .filter(|b| matches!(b.terminator, Terminator::Unreachable))
-        .map(|b| b.id)
-        .collect();
-
-    // Step 2 + 3: Remove canary statements and simplify guarding branches
+    // Only fix return values that are canary XOR results (not real return values)
     for block in &mut func.blocks {
-        block.stmts.retain(|s| {
-            match s {
-                Stmt::Assign(var, expr) => {
-                    let key = format!("{var}");
-                    // Remove `var_8 = rax` (canary stored to stack)
-                    if key == canary_key { return false; }
-                    // Remove `rax = Load(fs:0x28)` (canary load into register)
-                    if key == canary_reg_key && expr_references_canary(expr) {
-                        return false;
-                    }
-                    // Remove canary readback: `rax = Load(rbp + canary_off)`
-                    if let Expr::Load(addr, _) = expr
-                        && let Some(off) = extract_stack_offset(addr, func.has_frame_pointer)
-                            && off == canary_off {
-                                return false;
-                            }
-                    // Remove XOR results involving canary stack var or sentinel
-                    if expr_references_canary(expr) || expr_uses_var_key(expr, &canary_key) {
-                        return false;
-                    }
-                    true
-                }
-                _ => true,
-            }
-        });
-
-        // Simplify canary-guarding branches: only fold when exactly one side is unreachable.
-        // If both sides are reachable, keep the conditional branch to avoid semantic changes.
-        if let Terminator::Branch(cond, t, f) = &block.terminator
-            && (expr_references_canary(cond) || expr_uses_var_key(cond, &canary_key)) {
-                let t_unreachable = unreachable_blocks.contains(t);
-                let f_unreachable = unreachable_blocks.contains(f);
-                if t_unreachable && !f_unreachable {
-                    block.terminator = Terminator::Jump(*f);
-                } else if f_unreachable && !t_unreachable {
-                    block.terminator = Terminator::Jump(*t);
-                }
-                // If both reachable or both unreachable, leave the branch as-is.
-            }
-    }
-
-    // Step 4: Remove blocks that became unreachable
-    if func.blocks.len() > 1 {
-        let entry = func.blocks[0].id;
-        let mut reachable: HashSet<BlockId> = HashSet::new();
-        let mut worklist = vec![entry];
-        while let Some(bid) = worklist.pop() {
-            if !reachable.insert(bid) { continue; }
-            if let Some(block) = func.blocks.iter().find(|b| b.id == bid) {
-                match &block.terminator {
-                    Terminator::Jump(t) => worklist.push(*t),
-                    Terminator::Branch(_, t, f) => { worklist.push(*t); worklist.push(*f); }
-                    Terminator::Switch(_, cases, default) => {
-                        for (_, bid) in cases { worklist.push(*bid); }
-                        if let Some(d) = default { worklist.push(*d); }
-                    }
-                    _ => {}
-                }
+        if let Terminator::Return(Some(val)) = &block.terminator {
+            if is_canary_expr(val) {
+                block.terminator = Terminator::Return(None);
             }
         }
-        func.blocks.retain(|b| reachable.contains(&b.id));
     }
 }
 

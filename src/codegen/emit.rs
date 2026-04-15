@@ -741,6 +741,19 @@ impl<'a> CodeGenerator<'a> {
                         }
                     }
                 }
+                // Segment-relative accesses (fs:/gs:) use sentinel 0xFFFF_FFFF_FFFF_E000 + disp
+                if let Expr::Const(addr_val, _) = addr.as_ref() {
+                    let sentinel_base: u64 = 0xFFFF_FFFF_FFFF_E000;
+                    if *addr_val >= sentinel_base && *addr_val < sentinel_base + 0x1000 {
+                        let offset = addr_val - sentinel_base;
+                        return match width {
+                            BitWidth::Bit8  => format!("__readfsbyte(0x{offset:X})"),
+                            BitWidth::Bit16 => format!("__readfsword(0x{offset:X})"),
+                            BitWidth::Bit32 => format!("__readfsdword(0x{offset:X})"),
+                            _               => format!("__readfsqword(0x{offset:X})"),
+                        };
+                    }
+                }
                 format!("*({}*)({})", c_type(*width), self.expr_to_c(addr))
             }
             // A bare Cond can appear when the lifter lost track of which
